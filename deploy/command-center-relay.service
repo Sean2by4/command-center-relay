@@ -1,0 +1,17 @@
+[Unit]
+Description=Command Center Relay Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relay
+Group=relay
+WorkingDirectory=/opt/command-center-relay
+ExecStart=/opt/command-center-relay/command-center-relay serve --port 9876 --host 0.0.0.0
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
