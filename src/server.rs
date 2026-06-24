@@ -71,6 +71,7 @@ pub fn build_router(state: Arc<AppState>, static_dir: PathBuf) -> Router {
         .allow_origin(AllowOrigin::exact(HeaderValue::from_static("null")));
 
     Router::new()
+        .route("/health", axum::routing::get(health_handler))
         .route("/ws", axum::routing::get(ws_handler))
         .fallback_service(serve_dir)
         .layer(cors)
@@ -87,6 +88,15 @@ pub fn build_router(state: Arc<AppState>, static_dir: PathBuf) -> Router {
             HeaderValue::from_static("default-src 'self'"),
         ))
         .with_state(state)
+}
+
+async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let connections = state.broker.total_connection_count();
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "connections": connections,
+    }))
 }
 
 async fn ws_handler(

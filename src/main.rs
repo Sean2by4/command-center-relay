@@ -28,7 +28,7 @@ enum Commands {
     Serve {
         #[arg(long, default_value = "9876")]
         port: u16,
-        #[arg(long, default_value = "0.0.0.0")]
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(long, default_value = "relay.db")]
         db: PathBuf,
