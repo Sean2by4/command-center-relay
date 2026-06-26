@@ -326,6 +326,12 @@ async fn handle_control_message(
             // Client hello acknowledged (we already sent server hello)
         }
 
+        ControlMessage::Ping => {
+            let _ = outbound_tx.send(WsMessage::Text(
+                serde_json::to_string(&ControlMessage::Pong).unwrap(),
+            )).await;
+        }
+
         ControlMessage::Pong => {
             // Pong received, handled by ping_misses reset
         }
