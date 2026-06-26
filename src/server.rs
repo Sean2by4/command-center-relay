@@ -423,6 +423,7 @@ async fn handle_control_message(
         // Desktop -> Client(s) forwarding
         ControlMessage::SessionList { .. }
         | ControlMessage::SessionCreated { .. }
+        | ControlMessage::SessionRenamed { .. }
         | ControlMessage::SessionClosed { .. }
         | ControlMessage::PtyResized { .. } => {
             if let ConnectionRole::Desktop { username } = role {

@@ -108,6 +108,12 @@ pub enum ControlMessage {
         session_id: String,
         label: String,
     },
+    #[serde(rename = "session_renamed")]
+    SessionRenamed {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        label: String,
+    },
     #[serde(rename = "session_closed")]
     SessionClosed {
         #[serde(rename = "sessionId")]
