@@ -57,6 +57,7 @@ const MAX_TOTAL_CONNECTIONS: usize = 50;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerError {
+    #[allow(dead_code)] // retained for API stability; register_desktop is now last-writer-wins
     #[error("desktop already connected for this account")]
     DesktopAlreadyConnected,
     #[error("too many client connections (max {MAX_CLIENTS})")]
@@ -104,7 +105,13 @@ impl Broker {
         self.total_connections.load(Ordering::Relaxed)
     }
 
-    /// Register a desktop connection for an account.
+    /// Register a desktop connection for an account (last-writer-wins).
+    ///
+    /// If a desktop socket is already registered it is evicted (sent a Close)
+    /// and replaced by the new one. This prevents a reconnect deadlock: when a
+    /// desktop's TCP socket drops uncleanly it can linger as "online" while the
+    /// desktop's backoff loop opens a fresh connection — without eviction the
+    /// new connection would be refused until the stale socket times out.
     pub async fn register_desktop(
         &self,
         username: &str,
@@ -114,8 +121,12 @@ impl Broker {
         let state = accounts
             .entry(username.to_string())
             .or_insert_with(AccountState::new);
-        if state.desktop_tx.is_some() {
-            return Err(BrokerError::DesktopAlreadyConnected);
+        if let Some(old) = state.desktop_tx.take() {
+            let _ = old.try_send(WsMessage::Close);
+            tracing::info!(
+                username = %username,
+                "evicting stale desktop connection (last-writer-wins)"
+            );
         }
         state.desktop_tx = Some(tx);
         Ok(())
@@ -287,10 +298,11 @@ mod tests {
         broker.register_desktop("alice", tx.clone()).await.unwrap();
         assert!(broker.is_desktop_online("alice").await);
 
-        // Second registration should fail
+        // Second registration wins (last-writer-wins): the stale socket is
+        // evicted and the new one takes over — still online, no error.
         let (tx2, _rx2) = mpsc::channel(16);
-        let err = broker.register_desktop("alice", tx2).await.unwrap_err();
-        assert!(matches!(err, BrokerError::DesktopAlreadyConnected));
+        broker.register_desktop("alice", tx2).await.unwrap();
+        assert!(broker.is_desktop_online("alice").await);
 
         // Unregister and re-register should work
         broker.unregister_desktop("alice").await;

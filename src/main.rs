@@ -62,6 +62,17 @@ enum UserAction {
         #[arg(long, default_value = "relay.db")]
         db: PathBuf,
     },
+    /// Set the provisioned desktop key for an account (the host's bootstrap
+    /// credential). Stores a hash of the key; the desktop app presents the
+    /// plaintext key to authenticate and register as the host.
+    SetDesktopKey {
+        username: String,
+        /// High-entropy secret (e.g. 32 random bytes hex). Generate once, set it
+        /// here, and configure the same value in the desktop app.
+        key: String,
+        #[arg(long, default_value = "relay.db")]
+        db: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -188,6 +199,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         println!("{:<20} {:<10} {:<24}", acct.username, totp_status, acct.created_at);
                     }
                 }
+            }
+
+            UserAction::SetDesktopKey { username, key, db } => {
+                let database = Database::open(&db)?;
+                // Ensure the account exists before provisioning a key for it.
+                database.get_account(&username)?;
+
+                use sha2::{Digest, Sha256};
+                let hash = format!("{:x}", Sha256::digest(key.as_bytes()));
+                database.set_config(&format!("desktop_key:{username}"), &hash)?;
+
+                println!("Desktop key set for {username}.");
             }
         },
     }

@@ -45,11 +45,16 @@ pub enum ControlMessage {
     Auth {
         version: u32,
         username: String,
-        #[serde(rename = "passwordHash")]
-        password_hash: String,
+        #[serde(rename = "passwordHash", skip_serializing_if = "Option::is_none")]
+        password_hash: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         totp: Option<String>,
-        #[serde(rename = "deviceToken")]
+        #[serde(rename = "deviceToken", skip_serializing_if = "Option::is_none")]
         device_token: Option<String>,
+        /// Provisioned desktop key — present only when a desktop (host) authenticates.
+        /// Bypasses password/TOTP/approval and authorizes desktop registration.
+        #[serde(rename = "desktopKey", skip_serializing_if = "Option::is_none")]
+        desktop_key: Option<String>,
     },
     #[serde(rename = "auth_result")]
     AuthResult {
@@ -222,10 +227,11 @@ mod tests {
                 password_hash,
                 totp,
                 device_token,
+                ..
             } => {
                 assert_eq!(version, 1);
                 assert_eq!(username, "sean");
-                assert_eq!(password_hash, "abc123");
+                assert_eq!(password_hash.unwrap(), "abc123");
                 assert_eq!(totp.unwrap(), "654321");
                 assert_eq!(device_token.unwrap(), "jwt...");
             }

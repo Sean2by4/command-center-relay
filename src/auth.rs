@@ -7,7 +7,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -225,6 +225,26 @@ impl AuthManager {
         Ok(bcrypt::hash(password_sha256, 12)?)
     }
 
+    /// Store the SHA-256 hash of a provisioned desktop key for an account.
+    pub fn set_desktop_key(&self, username: &str, key: &str) -> Result<(), AuthError> {
+        self.db
+            .set_config(&format!("desktop_key:{username}"), &sha256_hex(key))?;
+        Ok(())
+    }
+
+    /// Verify a presented desktop key against the stored hash (constant-time).
+    /// Returns false if no key is provisioned for the account.
+    pub fn verify_desktop_key(&self, username: &str, key: &str) -> Result<bool, AuthError> {
+        let stored = match self.db.get_config(&format!("desktop_key:{username}"))? {
+            Some(h) => h,
+            None => return Ok(false),
+        };
+        Ok(constant_time_eq(
+            stored.as_bytes(),
+            sha256_hex(key).as_bytes(),
+        ))
+    }
+
     /// Generate a TOTP secret, encrypt it, and return (TOTP instance, encrypted_secret, nonce).
     pub fn generate_totp(
         username: &str,
@@ -275,6 +295,22 @@ fn generate_random_bytes(len: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; len];
     OsRng.fill_bytes(&mut bytes);
     bytes
+}
+
+fn sha256_hex(input: &str) -> String {
+    format!("{:x}", Sha256::digest(input.as_bytes()))
+}
+
+/// Length-independent constant-time byte comparison.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]

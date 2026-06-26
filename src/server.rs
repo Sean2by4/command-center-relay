@@ -335,6 +335,7 @@ async fn handle_control_message(
             password_hash,
             totp,
             device_token,
+            desktop_key,
             ..
         } => {
             // Validate username before processing
@@ -350,9 +351,10 @@ async fn handle_control_message(
 
             handle_auth(
                 username,
-                password_hash,
+                password_hash.as_deref(),
                 totp.as_deref(),
                 device_token.as_deref(),
+                desktop_key.as_deref(),
                 role,
                 state,
                 outbound_tx,
@@ -547,9 +549,10 @@ async fn handle_control_message(
 
 async fn handle_auth(
     username: &str,
-    password_hash: &str,
+    password_hash: Option<&str>,
     totp: Option<&str>,
     device_token: Option<&str>,
+    desktop_key: Option<&str>,
     role: &mut ConnectionRole,
     state: &Arc<AppState>,
     outbound_tx: &mpsc::Sender<WsMessage>,
@@ -579,6 +582,114 @@ async fn handle_auth(
         );
         return;
     }
+
+    // --- Desktop bootstrap: a provisioned desktop key authorizes the host
+    // directly, bypassing password / TOTP / device-approval. The key is the
+    // desktop's durable credential, so it can never sit in the approval queue. ---
+    if let Some(key) = desktop_key {
+        if state.auth.verify_desktop_key(username, key).unwrap_or(false) {
+            state.auth.clear_rate_limit(username);
+            let result = ControlMessage::AuthResult {
+                success: true,
+                token: None,
+                device_id: Some("desktop".into()),
+                error: None,
+                retry_after: None,
+            };
+            let _ = outbound_tx
+                .send(WsMessage::Text(serde_json::to_string(&result).unwrap()))
+                .await;
+            *role = ConnectionRole::Client {
+                username: username.to_string(),
+                device_id: "desktop".to_string(),
+            };
+            audit::log_audit(
+                state.auth.db(),
+                AuditEvent::AuthSuccess,
+                Some(username),
+                None,
+                Some(ip),
+                Some("desktop key"),
+            );
+        } else {
+            state.auth.record_failure(username);
+            send_auth_error(outbound_tx, "invalid_credentials").await;
+            audit::log_audit(
+                state.auth.db(),
+                AuditEvent::AuthFailure,
+                Some(username),
+                None,
+                Some(ip),
+                Some("bad desktop key"),
+            );
+        }
+        return;
+    }
+
+    // --- Returning device: a valid device token short-circuits BEFORE the
+    // password / TOTP gates so approved clients reconnect silently. The token
+    // is a standalone credential; TOTP already gated its enrollment. ---
+    if let Some(token) = device_token {
+        match state.auth.validate_jwt(token) {
+            Ok(claims) if claims.sub == username => {
+                if device::is_device_registered(state.auth.db(), &claims.device_id, username) {
+                    state.auth.clear_rate_limit(username);
+                    let _ = state
+                        .auth
+                        .db()
+                        .update_device_last_seen(&claims.device_id, ip);
+                    let new_token = state.auth.create_jwt(username, &claims.device_id).unwrap();
+                    let result = ControlMessage::AuthResult {
+                        success: true,
+                        token: Some(new_token),
+                        device_id: Some(claims.device_id.clone()),
+                        error: None,
+                        retry_after: None,
+                    };
+                    let _ = outbound_tx
+                        .send(WsMessage::Text(serde_json::to_string(&result).unwrap()))
+                        .await;
+                    let dev_id = claims.device_id;
+                    *role = ConnectionRole::Client {
+                        username: username.to_string(),
+                        device_id: dev_id.clone(),
+                    };
+                    let info = ClientInfo {
+                        device_id: dev_id.clone(),
+                        device_name: "Returning device".into(),
+                        ip: ip.to_string(),
+                        connected_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let _ = state
+                        .broker
+                        .register_client(username, outbound_tx.clone(), info)
+                        .await;
+                    audit::log_audit(
+                        state.auth.db(),
+                        AuditEvent::AuthSuccess,
+                        Some(username),
+                        Some(&dev_id),
+                        Some(ip),
+                        Some("returning device"),
+                    );
+                    return;
+                }
+                // Device was revoked — fall through to full credential auth.
+            }
+            _ => {
+                // Invalid/expired token — fall through to full credential auth.
+            }
+        }
+    }
+
+    // --- Password (required for credential-based client auth) ---
+    let password_hash = match password_hash {
+        Some(h) => h,
+        None => {
+            send_auth_error(outbound_tx, "invalid_credentials").await;
+            return;
+        }
+    };
 
     // Verify password
     if let Err(_) = state.auth.verify_password(username, password_hash).await {
@@ -629,62 +740,6 @@ async fn handle_auth(
     }
 
     state.auth.clear_rate_limit(username);
-
-    // Check device token
-    if let Some(token) = device_token {
-        // Returning client with existing device token
-        match state.auth.validate_jwt(token) {
-            Ok(claims) if claims.sub == username => {
-                // Check device still exists
-                if device::is_device_registered(state.auth.db(), &claims.device_id, username) {
-                    let _ = state
-                        .auth
-                        .db()
-                        .update_device_last_seen(&claims.device_id, ip);
-                    let new_token = state.auth.create_jwt(username, &claims.device_id).unwrap();
-                    let result = ControlMessage::AuthResult {
-                        success: true,
-                        token: Some(new_token),
-                        device_id: Some(claims.device_id.clone()),
-                        error: None,
-                        retry_after: None,
-                    };
-                    let _ = outbound_tx
-                        .send(WsMessage::Text(serde_json::to_string(&result).unwrap()))
-                        .await;
-                    let dev_id = claims.device_id;
-                    *role = ConnectionRole::Client {
-                        username: username.to_string(),
-                        device_id: dev_id.clone(),
-                    };
-                    // Register in broker
-                    let info = ClientInfo {
-                        device_id: dev_id.clone(),
-                        device_name: "Returning device".into(),
-                        ip: ip.to_string(),
-                        connected_at: chrono::Utc::now().to_rfc3339(),
-                    };
-                    let _ = state
-                        .broker
-                        .register_client(username, outbound_tx.clone(), info)
-                        .await;
-                    audit::log_audit(
-                        state.auth.db(),
-                        AuditEvent::AuthSuccess,
-                        Some(username),
-                        Some(&dev_id),
-                        Some(ip),
-                        Some("returning device"),
-                    );
-                    return;
-                }
-                // Device was revoked, fall through to new device flow
-            }
-            _ => {
-                // Invalid token, fall through to new device flow
-            }
-        }
-    }
 
     // New device — needs approval from desktop
     // First check if desktop is online
