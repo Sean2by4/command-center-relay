@@ -96,6 +96,8 @@ pub enum ControlMessage {
     },
 
     // --- Sessions ---
+    #[serde(rename = "session_spawn_request")]
+    SessionSpawnRequest { cols: u16, rows: u16 },
     #[serde(rename = "session_list_request")]
     SessionListRequest,
     #[serde(rename = "session_list")]

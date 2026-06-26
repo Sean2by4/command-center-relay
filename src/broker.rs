@@ -129,6 +129,16 @@ impl Broker {
             );
         }
         state.desktop_tx = Some(tx);
+        // Notify all clients that desktop came online
+        let online_msg = WsMessage::Text(
+            serde_json::to_string(&crate::protocol::ControlMessage::DesktopStatus {
+                online: true,
+            })
+            .unwrap_or_default(),
+        );
+        for client in &state.clients {
+            let _ = client.tx.try_send(online_msg.clone());
+        }
         Ok(())
     }
 
