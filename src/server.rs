@@ -103,8 +103,15 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let ip = addr.ip().to_string();
+    // Prefer X-Real-IP set by nginx (unforgeable — always $remote_addr).
+    // Fall back to peer addr for direct connections.
+    let ip = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
 
     // Server-wide connection limit
     if state.broker.try_acquire_connection().is_err() {
@@ -119,7 +126,7 @@ async fn ws_handler(
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, addr))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, ip))
         .into_response()
 }
 
@@ -154,8 +161,7 @@ fn is_valid_device_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_graphic() || c == ' ')
 }
 
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>, addr: SocketAddr) {
-    let ip = addr.ip().to_string();
+async fn handle_socket(socket: WebSocket, state: Arc<AppState>, ip: String) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     // Channel for outbound messages to this connection
@@ -459,6 +465,19 @@ async fn handle_control_message(
                             .client_tx
                             .send(WsMessage::Text(serde_json::to_string(&result).unwrap()))
                             .await;
+
+                        // Register with broker so desktop→client messages flow
+                        // while the client re-auths to promote its server-side role.
+                        let info = ClientInfo {
+                            device_id: pending.device_id.clone(),
+                            device_name: pending.device_name.clone(),
+                            ip: pending.ip.clone(),
+                            connected_at: chrono::Utc::now().to_rfc3339(),
+                        };
+                        let _ = state
+                            .broker
+                            .register_client(username, pending.client_tx.clone(), info)
+                            .await;
                     }
                     audit::log_audit(
                         state.auth.db(),
@@ -734,7 +753,7 @@ async fn handle_auth(
             Some(code) => {
                 if let Err(_) = state.auth.verify_totp(username, code) {
                     state.auth.record_failure(username);
-                    send_auth_error(outbound_tx, "invalid_credentials").await;
+                    send_auth_error(outbound_tx, "invalid_totp").await;
                     audit::log_audit(
                         state.auth.db(),
                         AuditEvent::AuthFailure,

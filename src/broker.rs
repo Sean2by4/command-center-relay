@@ -166,7 +166,8 @@ impl Broker {
         }
     }
 
-    /// Register a client connection.
+    /// Register a client connection. If a client with the same device_id
+    /// already exists (e.g. re-auth after approval), update its sender.
     pub async fn register_client(
         &self,
         username: &str,
@@ -177,6 +178,11 @@ impl Broker {
         let state = accounts
             .entry(username.to_string())
             .or_insert_with(AccountState::new);
+        if let Some(existing) = state.clients.iter_mut().find(|c| c.info.device_id == info.device_id) {
+            existing.tx = tx;
+            existing.info = info;
+            return Ok(());
+        }
         if state.clients.len() >= MAX_CLIENTS {
             return Err(BrokerError::TooManyClients);
         }
