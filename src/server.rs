@@ -410,7 +410,8 @@ async fn handle_control_message(
         // Client -> Desktop forwarding
         ControlMessage::SessionSpawnRequest { .. }
         | ControlMessage::SessionListRequest
-        | ControlMessage::PtyResize { .. } => {
+        | ControlMessage::PtyResize { .. }
+        | ControlMessage::SessionRenamed { .. } => {
             if let ConnectionRole::Client { username, .. } = role {
                 let json = serde_json::to_string(msg).unwrap();
                 let _ = state
