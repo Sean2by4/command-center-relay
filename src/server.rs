@@ -416,8 +416,7 @@ async fn handle_control_message(
         // Client -> Desktop forwarding
         ControlMessage::SessionSpawnRequest { .. }
         | ControlMessage::SessionListRequest
-        | ControlMessage::PtyResize { .. }
-        | ControlMessage::SessionRenamed { .. } => {
+        | ControlMessage::PtyResize { .. } => {
             if let ConnectionRole::Client { username, .. } = role {
                 let json = serde_json::to_string(msg).unwrap();
                 let _ = state
@@ -427,10 +426,29 @@ async fn handle_control_message(
             }
         }
 
+        // Bidirectional: client renames forward to desktop, desktop renames broadcast to clients
+        ControlMessage::SessionRenamed { .. } => {
+            let json = serde_json::to_string(msg).unwrap();
+            match role {
+                ConnectionRole::Client { username, .. } => {
+                    let _ = state
+                        .broker
+                        .send_to_desktop(username, WsMessage::Text(json))
+                        .await;
+                }
+                ConnectionRole::Desktop { username } => {
+                    state
+                        .broker
+                        .broadcast_to_clients(username, WsMessage::Text(json))
+                        .await;
+                }
+                _ => {}
+            }
+        }
+
         // Desktop -> Client(s) forwarding
         ControlMessage::SessionList { .. }
         | ControlMessage::SessionCreated { .. }
-        | ControlMessage::SessionRenamed { .. }
         | ControlMessage::SessionClosed { .. }
         | ControlMessage::PtyResized { .. } => {
             if let ConnectionRole::Desktop { username } = role {
