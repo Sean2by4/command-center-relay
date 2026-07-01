@@ -15,6 +15,8 @@ pub struct SessionInfo {
     pub cwd: String,
     pub cols: u16,
     pub rows: u16,
+    #[serde(rename = "createdAt", default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +109,8 @@ pub enum ControlMessage {
         #[serde(rename = "sessionId")]
         session_id: String,
         label: String,
+        #[serde(rename = "createdAt", default, skip_serializing_if = "Option::is_none")]
+        created_at: Option<u64>,
     },
     #[serde(rename = "session_renamed")]
     SessionRenamed {
@@ -309,6 +313,7 @@ mod tests {
                 cwd: "/home/sean".into(),
                 cols: 120,
                 rows: 40,
+                created_at: Some(1719700000000),
             }],
         };
         let json = serde_json::to_string(&msg).unwrap();
