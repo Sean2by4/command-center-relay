@@ -89,6 +89,11 @@ impl ConnTx {
     pub fn clear_dirty(&self) {
         self.dirty.store(false, Ordering::Relaxed);
     }
+
+    /// Same underlying connection (the queued counter is per-connection).
+    pub fn same_conn(&self, other: &ConnTx) -> bool {
+        Arc::ptr_eq(&self.queued, &other.queued)
+    }
 }
 
 /// Info about a connected client.
@@ -237,9 +242,23 @@ impl Broker {
     }
 
     /// Unregister a desktop connection.
-    pub async fn unregister_desktop(&self, username: &str) {
+    ///
+    /// `conn` is the disconnecting connection: when a stale desktop socket
+    /// (evicted by last-writer-wins) finally dies, its cleanup must NOT wipe
+    /// the registration of the desktop that replaced it.
+    pub async fn unregister_desktop(&self, username: &str, conn: &ConnTx) {
         let mut accounts = self.accounts.write().await;
         if let Some(state) = accounts.get_mut(username) {
+            match &state.desktop_tx {
+                Some(current) if !current.same_conn(conn) => {
+                    tracing::info!(
+                        username = %username,
+                        "stale desktop disconnect ignored (already replaced)"
+                    );
+                    return;
+                }
+                _ => {}
+            }
             state.desktop_tx = None;
             state.replay_queue.clear();
             state.replay_target = None;
@@ -566,11 +585,16 @@ mod tests {
         // Second registration wins (last-writer-wins): the stale socket is
         // evicted and the new one takes over — still online, no error.
         let (tx2, _rx2) = test_conn();
-        broker.register_desktop("alice", tx2).await.unwrap();
+        broker.register_desktop("alice", tx2.clone()).await.unwrap();
         assert!(broker.is_desktop_online("alice").await);
 
-        // Unregister and re-register should work
-        broker.unregister_desktop("alice").await;
+        // The evicted stale connection's disconnect cleanup must NOT wipe
+        // the replacement's registration.
+        broker.unregister_desktop("alice", &tx).await;
+        assert!(broker.is_desktop_online("alice").await);
+
+        // Unregister by the current connection works, then re-register.
+        broker.unregister_desktop("alice", &tx2).await;
         assert!(!broker.is_desktop_online("alice").await);
         broker.register_desktop("alice", tx).await.unwrap();
     }
@@ -731,7 +755,7 @@ mod tests {
     async fn test_desktop_offline_notification() {
         let broker = Broker::new();
         let (dtx, _drx) = test_conn();
-        broker.register_desktop("alice", dtx).await.unwrap();
+        broker.register_desktop("alice", dtx.clone()).await.unwrap();
 
         let (ctx, mut crx) = test_conn();
         let info = ClientInfo {
@@ -742,7 +766,7 @@ mod tests {
         };
         broker.register_client("alice", ctx, info).await.unwrap();
 
-        broker.unregister_desktop("alice").await;
+        broker.unregister_desktop("alice", &dtx).await;
 
         // Client should receive desktop_status offline
         match crx.recv().await.unwrap() {

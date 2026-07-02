@@ -299,7 +299,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, ip: String) {
     // Cleanup on disconnect
     match &role {
         ConnectionRole::Desktop { username } => {
-            state.broker.unregister_desktop(username).await;
+            state.broker.unregister_desktop(username, &outbound_tx).await;
             audit::log_audit(
                 state.auth.db(),
                 AuditEvent::DesktopDisconnected,
