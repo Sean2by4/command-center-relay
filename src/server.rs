@@ -1,6 +1,6 @@
-use crate::audit::{self, AuditEvent};
+﻿use crate::audit::{self, AuditEvent};
 use crate::auth::AuthManager;
-use crate::broker::{Broker, ClientInfo, PendingDevice, WsMessage};
+use crate::broker::{Broker, ClientInfo, ConnTx, PendingDevice, WsMessage};
 use crate::device;
 use crate::protocol::{self, ControlMessage};
 use crate::push::PushManager;
@@ -167,16 +167,27 @@ fn is_valid_device_name(name: &str) -> bool {
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>, ip: String) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Channel for outbound messages to this connection
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<WsMessage>(256);
+    // Outbound queue for this connection: unbounded with explicit byte
+    // accounting (the broker's per-client budget marks slow clients dirty
+    // instead of silently dropping frames — see broker::ConnTx).
+    let (raw_tx, mut outbound_rx) = mpsc::unbounded_channel::<WsMessage>();
+    let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outbound_tx = ConnTx::new(raw_tx, queued.clone());
 
     // Spawn outbound writer
     let writer = tokio::spawn(async move {
         use futures_util::SinkExt;
+        use std::sync::atomic::Ordering;
         while let Some(msg) = outbound_rx.recv().await {
             let ws_msg = match msg {
-                WsMessage::Text(t) => Message::Text(t.into()),
-                WsMessage::Binary(b) => Message::Binary(b.into()),
+                WsMessage::Text(t) => {
+                    queued.fetch_sub(t.len(), Ordering::Relaxed);
+                    Message::Text(t.into())
+                }
+                WsMessage::Binary(b) => {
+                    queued.fetch_sub(b.len(), Ordering::Relaxed);
+                    Message::Binary(b.into())
+                }
                 WsMessage::Close => {
                     let _ = ws_sender.close().await;
                     break;
@@ -195,8 +206,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, ip: String) {
         server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
     let _ = outbound_tx
-        .send(WsMessage::Text(serde_json::to_string(&hello).unwrap()))
-        .await;
+        .send(WsMessage::Text(serde_json::to_string(&hello).unwrap()));
 
     let mut role = ConnectionRole::Unauthenticated;
     let mut ping_misses = 0u32;
@@ -216,7 +226,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, ip: String) {
                 }
                 let _ = outbound_tx.send(WsMessage::Text(
                     serde_json::to_string(&ControlMessage::Ping).unwrap()
-                )).await;
+                ));
             }
             msg = ws_receiver.next() => {
                 match msg {
@@ -319,7 +329,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, ip: String) {
     // Release the server-wide connection slot
     state.broker.release_connection();
 
-    let _ = outbound_tx.send(WsMessage::Close).await;
+    let _ = outbound_tx.send(WsMessage::Close);
     writer.abort();
 }
 
@@ -327,7 +337,7 @@ async fn handle_control_message(
     msg: &ControlMessage,
     role: &mut ConnectionRole,
     state: &Arc<AppState>,
-    outbound_tx: &mpsc::Sender<WsMessage>,
+    outbound_tx: &ConnTx,
     ip: &str,
 ) {
     match msg {
@@ -338,7 +348,7 @@ async fn handle_control_message(
         ControlMessage::Ping => {
             let _ = outbound_tx.send(WsMessage::Text(
                 serde_json::to_string(&ControlMessage::Pong).unwrap(),
-            )).await;
+            ));
         }
 
         ControlMessage::Pong => {
@@ -397,8 +407,7 @@ async fn handle_control_message(
                         let _ = outbound_tx
                             .send(WsMessage::Text(
                                 serde_json::to_string(&ControlMessage::DesktopRegistered).unwrap(),
-                            ))
-                            .await;
+                            ));
                         audit::log_audit(
                             state.auth.db(),
                             AuditEvent::DesktopConnected,
@@ -418,7 +427,6 @@ async fn handle_control_message(
 
         // Client -> Desktop forwarding
         ControlMessage::SessionSpawnRequest { .. }
-        | ControlMessage::SessionListRequest
         | ControlMessage::SessionCloseRequest { .. }
         | ControlMessage::PtyResize { .. } => {
             if let ConnectionRole::Client { username, .. } = role {
@@ -427,6 +435,31 @@ async fn handle_control_message(
                     .broker
                     .send_to_desktop(username, WsMessage::Text(json))
                     .await;
+            }
+        }
+
+        // List requests are queued so the desktop's reply burst (replay_begin
+        // + scrollback + session_list) can be routed back to the requester
+        // only, instead of resetting every connected client's terminal.
+        ControlMessage::SessionListRequest => {
+            if let ConnectionRole::Client { username, device_id } = role {
+                state
+                    .broker
+                    .note_session_list_request(username, device_id)
+                    .await;
+                let json = serde_json::to_string(msg).unwrap();
+                let _ = state
+                    .broker
+                    .send_to_desktop(username, WsMessage::Text(json))
+                    .await;
+            }
+        }
+
+        // Desktop announces the start of a replay burst. Consumed here —
+        // never forwarded.
+        ControlMessage::ReplayBegin => {
+            if let ConnectionRole::Desktop { username } = role {
+                state.broker.begin_replay(username).await;
             }
         }
 
@@ -451,8 +484,7 @@ async fn handle_control_message(
         }
 
         // Desktop -> Client(s) forwarding
-        ControlMessage::SessionList { .. }
-        | ControlMessage::SessionCreated { .. }
+        ControlMessage::SessionCreated { .. }
         | ControlMessage::SessionClosed { .. }
         | ControlMessage::ContextUpdate { .. }
         | ControlMessage::PtyResized { .. } => {
@@ -462,6 +494,29 @@ async fn handle_control_message(
                     .broker
                     .broadcast_to_clients(username, WsMessage::Text(json))
                     .await;
+            }
+        }
+
+        // A session_list terminates a replay burst: routed to the requester
+        // when the desktop tagged the burst (replay_begin), broadcast for old
+        // desktops that don't.
+        ControlMessage::SessionList { .. } => {
+            if let ConnectionRole::Desktop { username } = role {
+                let json = serde_json::to_string(msg).unwrap();
+                match state.broker.end_replay(username).await {
+                    Some(device_id) => {
+                        let _ = state
+                            .broker
+                            .send_to_client(username, &device_id, WsMessage::Text(json))
+                            .await;
+                    }
+                    None => {
+                        state
+                            .broker
+                            .broadcast_to_clients(username, WsMessage::Text(json))
+                            .await;
+                    }
+                }
             }
         }
 
@@ -557,8 +612,7 @@ async fn handle_control_message(
                     key: state.push.public_key().to_string(),
                 };
                 let _ = outbound_tx
-                    .send(WsMessage::Text(serde_json::to_string(&reply).unwrap()))
-                    .await;
+                    .send(WsMessage::Text(serde_json::to_string(&reply).unwrap()));
             }
         }
 
@@ -583,10 +637,9 @@ async fn handle_control_message(
                         };
                         let _ = pending
                             .client_tx
-                            .send(WsMessage::Text(serde_json::to_string(&result).unwrap()))
-                            .await;
+                            .send(WsMessage::Text(serde_json::to_string(&result).unwrap()));
 
-                        // Register with broker so desktop→client messages flow
+                        // Register with broker so desktopâ†’client messages flow
                         // while the client re-auths to promote its server-side role.
                         let info = ClientInfo {
                             device_id: pending.device_id.clone(),
@@ -623,8 +676,7 @@ async fn handle_control_message(
                     };
                     let _ = pending
                         .client_tx
-                        .send(WsMessage::Text(serde_json::to_string(&result).unwrap()))
-                        .await;
+                        .send(WsMessage::Text(serde_json::to_string(&result).unwrap()));
                     // Remove device from DB
                     let _ = device::revoke_device(state.auth.db(), &pending.device_id);
                     audit::log_audit(
@@ -654,8 +706,7 @@ async fn handle_control_message(
                     .collect();
                 let msg = ControlMessage::ConnectedDevicesList { devices };
                 let _ = outbound_tx
-                    .send(WsMessage::Text(serde_json::to_string(&msg).unwrap()))
-                    .await;
+                    .send(WsMessage::Text(serde_json::to_string(&msg).unwrap()));
             }
         }
 
@@ -685,8 +736,7 @@ async fn handle_control_message(
                 );
                 // Confirm to desktop
                 let _ = outbound_tx
-                    .send(WsMessage::Text(serde_json::to_string(&revoked_msg).unwrap()))
-                    .await;
+                    .send(WsMessage::Text(serde_json::to_string(&revoked_msg).unwrap()));
             }
         }
 
@@ -704,7 +754,7 @@ async fn handle_auth(
     desktop_key: Option<&str>,
     role: &mut ConnectionRole,
     state: &Arc<AppState>,
-    outbound_tx: &mpsc::Sender<WsMessage>,
+    outbound_tx: &ConnTx,
     ip: &str,
 ) {
     // Rate limit check
@@ -719,8 +769,7 @@ async fn handle_auth(
             retry_after: Some(retry_after),
         };
         let _ = outbound_tx
-            .send(WsMessage::Text(serde_json::to_string(&result).unwrap()))
-            .await;
+            .send(WsMessage::Text(serde_json::to_string(&result).unwrap()));
         audit::log_audit(
             state.auth.db(),
             AuditEvent::AuthRateLimited,
@@ -746,8 +795,7 @@ async fn handle_auth(
                 retry_after: None,
             };
             let _ = outbound_tx
-                .send(WsMessage::Text(serde_json::to_string(&result).unwrap()))
-                .await;
+                .send(WsMessage::Text(serde_json::to_string(&result).unwrap()));
             *role = ConnectionRole::Client {
                 username: username.to_string(),
                 device_id: "desktop".to_string(),
@@ -796,8 +844,7 @@ async fn handle_auth(
                         retry_after: None,
                     };
                     let _ = outbound_tx
-                        .send(WsMessage::Text(serde_json::to_string(&result).unwrap()))
-                        .await;
+                        .send(WsMessage::Text(serde_json::to_string(&result).unwrap()));
                     let dev_id = claims.device_id;
                     *role = ConnectionRole::Client {
                         username: username.to_string(),
@@ -953,14 +1000,33 @@ async fn handle_binary_message(data: &[u8], role: &ConnectionRole, state: &Arc<A
                 }
             }
             ConnectionRole::Desktop { username } => {
-                if matches!(
-                    frame_type,
-                    protocol::PTY_OUTPUT | protocol::PTY_SCROLLBACK
-                ) {
+                if frame_type == protocol::PTY_OUTPUT {
                     state
                         .broker
                         .broadcast_to_clients(username, WsMessage::Binary(data.to_vec()))
                         .await;
+                } else if frame_type == protocol::PTY_SCROLLBACK {
+                    // Replay frames go to the client whose list request
+                    // started this burst (replay_begin); broadcast only for
+                    // old desktops that don't tag bursts.
+                    match state.broker.replay_target(username).await {
+                        Some(device_id) => {
+                            let _ = state
+                                .broker
+                                .send_to_client(
+                                    username,
+                                    &device_id,
+                                    WsMessage::Binary(data.to_vec()),
+                                )
+                                .await;
+                        }
+                        None => {
+                            state
+                                .broker
+                                .broadcast_to_clients(username, WsMessage::Binary(data.to_vec()))
+                                .await;
+                        }
+                    }
                 }
             }
             ConnectionRole::Unauthenticated => {}
@@ -971,7 +1037,7 @@ async fn handle_binary_message(data: &[u8], role: &ConnectionRole, state: &Arc<A
     }
 }
 
-async fn send_auth_error(tx: &mpsc::Sender<WsMessage>, error: &str) {
+async fn send_auth_error(tx: &ConnTx, error: &str) {
     let result = ControlMessage::AuthResult {
         success: false,
         token: None,
@@ -980,8 +1046,7 @@ async fn send_auth_error(tx: &mpsc::Sender<WsMessage>, error: &str) {
         retry_after: None,
     };
     let _ = tx
-        .send(WsMessage::Text(serde_json::to_string(&result).unwrap()))
-        .await;
+        .send(WsMessage::Text(serde_json::to_string(&result).unwrap()));
 }
 
 /// TcpListener wrapper that sets TCP_NODELAY on every accepted connection.

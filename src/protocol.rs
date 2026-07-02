@@ -181,6 +181,19 @@ pub enum ControlMessage {
         rows: u16,
     },
 
+    // --- Replay routing / recovery ---
+    /// Desktop → relay: the scrollback replay for the oldest queued
+    /// session_list_request follows. Lets the relay route the replay burst
+    /// (binary scrollback + trailing session_list) to the requesting client
+    /// only instead of broadcasting it. Never forwarded to clients.
+    #[serde(rename = "replay_begin")]
+    ReplayBegin,
+    /// Relay → client: live output was dropped for this connection under
+    /// backpressure — request a session list (which triggers a scrollback
+    /// replay) to converge back to the current screen.
+    #[serde(rename = "resync_required")]
+    ResyncRequired,
+
     // --- Health ---
     #[serde(rename = "ping")]
     Ping,
