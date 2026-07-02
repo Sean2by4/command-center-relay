@@ -105,7 +105,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(ClientAddr(addr)): ConnectInfo<ClientAddr>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     // Prefer X-Real-IP set by nginx (unforgeable — always $remote_addr).
@@ -984,6 +984,44 @@ async fn send_auth_error(tx: &mpsc::Sender<WsMessage>, error: &str) {
         .await;
 }
 
+/// TcpListener wrapper that sets TCP_NODELAY on every accepted connection.
+/// Keystroke frames are ~38 bytes; Nagle coalescing adds visible typing latency.
+struct NoDelayListener(tokio::net::TcpListener);
+
+impl axum::serve::Listener for NoDelayListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.0.accept().await {
+                Ok((stream, addr)) => {
+                    let _ = stream.set_nodelay(true);
+                    return (stream, addr);
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.0.local_addr()
+    }
+}
+
+/// Peer address pulled from NoDelayListener streams (orphan rules prevent
+/// implementing Connected directly for SocketAddr with a custom listener).
+#[derive(Clone, Copy, Debug)]
+pub struct ClientAddr(pub SocketAddr);
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, NoDelayListener>>
+    for ClientAddr
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, NoDelayListener>) -> Self {
+        ClientAddr(*stream.remote_addr())
+    }
+}
+
 /// Run the server.
 pub async fn run(
     host: &str,
@@ -999,8 +1037,8 @@ pub async fn run(
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        NoDelayListener(listener),
+        app.into_make_service_with_connect_info::<ClientAddr>(),
     )
     .with_graceful_shutdown(async move {
         let mut rx = shutdown_rx;
