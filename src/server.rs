@@ -3,6 +3,7 @@ use crate::auth::AuthManager;
 use crate::broker::{Broker, ClientInfo, PendingDevice, WsMessage};
 use crate::device;
 use crate::protocol::{self, ControlMessage};
+use crate::push::PushManager;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
 use axum::http::{HeaderValue, StatusCode};
@@ -29,15 +30,17 @@ const SHUTDOWN_GRACE_SECS: u64 = 5;
 pub struct AppState {
     pub broker: Broker,
     pub auth: AuthManager,
+    pub push: PushManager,
     /// Per-IP WebSocket connection rate limiter: IP -> list of connection timestamps.
     ws_rate_limits: Mutex<HashMap<String, Vec<std::time::Instant>>>,
 }
 
 impl AppState {
-    pub fn new(broker: Broker, auth: AuthManager) -> Self {
+    pub fn new(broker: Broker, auth: AuthManager, push: PushManager) -> Self {
         Self {
             broker,
             auth,
+            push,
             ws_rate_limits: Mutex::new(HashMap::new()),
         }
     }
@@ -416,6 +419,7 @@ async fn handle_control_message(
         // Client -> Desktop forwarding
         ControlMessage::SessionSpawnRequest { .. }
         | ControlMessage::SessionListRequest
+        | ControlMessage::SessionCloseRequest { .. }
         | ControlMessage::PtyResize { .. } => {
             if let ConnectionRole::Client { username, .. } = role {
                 let json = serde_json::to_string(msg).unwrap();
@@ -450,12 +454,110 @@ async fn handle_control_message(
         ControlMessage::SessionList { .. }
         | ControlMessage::SessionCreated { .. }
         | ControlMessage::SessionClosed { .. }
+        | ControlMessage::ContextUpdate { .. }
         | ControlMessage::PtyResized { .. } => {
             if let ConnectionRole::Desktop { username } = role {
                 let json = serde_json::to_string(msg).unwrap();
                 state
                     .broker
                     .broadcast_to_clients(username, WsMessage::Text(json))
+                    .await;
+            }
+        }
+
+        // Desktop -> Client(s) + Web Push fan-out
+        ControlMessage::SessionNotification {
+            session_id,
+            title,
+            body,
+        } => {
+            if let ConnectionRole::Desktop { username } = role {
+                // Clamp: titles come from arbitrary session renames, and an
+                // oversized payload breaks the single-record 4KB push framing.
+                let title: String = title.chars().take(120).collect();
+                let body: String = body.chars().take(300).collect();
+
+                let clamped = ControlMessage::SessionNotification {
+                    session_id: session_id.clone(),
+                    title: title.clone(),
+                    body: body.clone(),
+                };
+                state
+                    .broker
+                    .broadcast_to_clients(
+                        username,
+                        WsMessage::Text(serde_json::to_string(&clamped).unwrap()),
+                    )
+                    .await;
+
+                // Fan out web push off the desktop's read loop: HTTP round
+                // trips to push services must never stall PTY forwarding.
+                let payload = serde_json::json!({
+                    "sessionId": session_id,
+                    "title": title,
+                    "body": body,
+                });
+                let state = state.clone();
+                let username = username.clone();
+                tokio::spawn(async move {
+                    state.push.send_to_user(&username, &payload).await;
+                });
+            }
+        }
+
+        // --- Web push registration (clients only) ---
+        ControlMessage::PushSubscribe { subscription } => {
+            if let ConnectionRole::Client {
+                username,
+                device_id,
+            } = role
+            {
+                // The desktop authenticates with the synthetic "desktop" device
+                // id, which has no row in the devices table — skip it.
+                if device_id == "desktop" {
+                    return;
+                }
+                let endpoint_ok = subscription
+                    .get("endpoint")
+                    .and_then(|e| e.as_str())
+                    .map(crate::push::is_valid_push_endpoint)
+                    .unwrap_or(false);
+                if !endpoint_ok {
+                    tracing::warn!(device_id = %device_id, "rejecting push subscription with invalid endpoint");
+                    return;
+                }
+                match serde_json::to_string(subscription) {
+                    Ok(json) if json.len() <= 4096 => {
+                        if let Err(e) =
+                            state
+                                .auth
+                                .db()
+                                .upsert_push_subscription(device_id, username, &json)
+                        {
+                            tracing::error!(error = %e, "failed to store push subscription");
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::warn!(device_id = %device_id, "rejecting oversized push subscription");
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
+        ControlMessage::PushUnsubscribe => {
+            if let ConnectionRole::Client { device_id, .. } = role {
+                let _ = state.auth.db().remove_push_subscription(device_id);
+            }
+        }
+
+        ControlMessage::VapidKeyRequest => {
+            if !matches!(role, ConnectionRole::Unauthenticated) {
+                let reply = ControlMessage::VapidPublicKey {
+                    key: state.push.public_key().to_string(),
+                };
+                let _ = outbound_tx
+                    .send(WsMessage::Text(serde_json::to_string(&reply).unwrap()))
                     .await;
             }
         }

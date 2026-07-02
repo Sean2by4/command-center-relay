@@ -62,6 +62,7 @@ impl Database {
     fn run_migrations(&self) -> Result<(), DbError> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(include_str!("../migrations/001_initial.sql"))?;
+        conn.execute_batch(include_str!("../migrations/002_push_subscriptions.sql"))?;
         Ok(())
     }
 
@@ -211,6 +212,44 @@ impl Database {
             params![device_id, ip],
         )?;
         Ok(())
+    }
+
+    // --- Push subscriptions ---
+
+    pub fn upsert_push_subscription(
+        &self,
+        device_id: &str,
+        username: &str,
+        subscription_json: &str,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO push_subscriptions (device_id, username, subscription_json) VALUES (?1, ?2, ?3)
+             ON CONFLICT(device_id) DO UPDATE SET subscription_json = ?3, created_at = datetime('now')",
+            params![device_id, username, subscription_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_push_subscription(&self, device_id: &str) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM push_subscriptions WHERE device_id = ?1",
+            params![device_id],
+        )?;
+        Ok(())
+    }
+
+    /// All push subscriptions for an account, as (device_id, subscription_json).
+    pub fn list_push_subscriptions(&self, username: &str) -> Result<Vec<(String, String)>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT device_id, subscription_json FROM push_subscriptions WHERE username = ?1",
+        )?;
+        let subs = stmt
+            .query_map(params![username], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(subs)
     }
 
     // --- Config ---

@@ -4,6 +4,7 @@ mod broker;
 mod db;
 mod device;
 mod protocol;
+mod push;
 mod server;
 
 use auth::AuthManager;
@@ -90,9 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .init();
 
             let database = Database::open(&db)?;
+            let push = push::PushManager::init(database.clone())?;
             let auth = AuthManager::new(database)?;
             let broker = Broker::new();
-            let state = Arc::new(AppState::new(broker, auth));
+            let state = Arc::new(AppState::new(broker, auth, push));
 
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 

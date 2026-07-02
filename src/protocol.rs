@@ -123,6 +123,47 @@ pub enum ControlMessage {
         #[serde(rename = "sessionId")]
         session_id: String,
     },
+    /// Client asks the desktop to kill a session's PTY. The desktop's normal
+    /// exit path then broadcasts `session_closed` to every client.
+    #[serde(rename = "session_close_request")]
+    SessionCloseRequest {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
+
+    // --- Session events (desktop → clients) ---
+    /// A long-running session finished working; fan out to clients (and web
+    /// push subscribers when configured).
+    #[serde(rename = "session_notification")]
+    SessionNotification {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        title: String,
+        body: String,
+    },
+    /// Claude Code context-window usage for a session, sourced from the
+    /// desktop's statusline bridge.
+    #[serde(rename = "context_update")]
+    ContextUpdate {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "usedPct")]
+        used_pct: f64,
+        #[serde(rename = "usedTokens", default, skip_serializing_if = "Option::is_none")]
+        used_tokens: Option<u64>,
+        #[serde(rename = "maxTokens", default, skip_serializing_if = "Option::is_none")]
+        max_tokens: Option<u64>,
+    },
+
+    // --- Web push ---
+    #[serde(rename = "push_subscribe")]
+    PushSubscribe { subscription: serde_json::Value },
+    #[serde(rename = "push_unsubscribe")]
+    PushUnsubscribe,
+    #[serde(rename = "vapid_key_request")]
+    VapidKeyRequest,
+    #[serde(rename = "vapid_public_key")]
+    VapidPublicKey { key: String },
 
     // --- Resize ---
     #[serde(rename = "pty_resize")]
