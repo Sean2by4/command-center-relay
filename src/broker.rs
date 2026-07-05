@@ -355,15 +355,40 @@ impl Broker {
             .entry(username.to_string())
             .or_insert_with(AccountState::new);
         if let Some(existing) = state.clients.iter_mut().find(|c| c.tx.same_conn(&tx)) {
-            existing.tx = tx;
+            existing.tx = tx.clone();
             existing.info = info;
+            Self::replay_desktop_status(state, &tx);
             return Ok(());
         }
         if state.clients.len() >= MAX_CLIENTS {
             return Err(BrokerError::TooManyClients);
         }
-        state.clients.push(ClientConnection { tx, info });
+        state.clients.push(ClientConnection {
+            tx: tx.clone(),
+            info,
+        });
+        // A client that connects AFTER the desktop registered would otherwise
+        // never hear its capabilities (DesktopStatus is only emitted on change),
+        // leaving upload/bug-report UI hidden against a capable desktop.
+        Self::replay_desktop_status(state, &tx);
         Ok(())
+    }
+
+    /// Send the current desktop online/capability state to one just-joined
+    /// client. No-op when no desktop is registered — the client's optimistic
+    /// default covers that until a real status change arrives.
+    fn replay_desktop_status(state: &AccountState, tx: &ConnTx) {
+        if state.desktop_tx.is_none() {
+            return;
+        }
+        let msg = WsMessage::Text(
+            serde_json::to_string(&crate::protocol::ControlMessage::DesktopStatus {
+                online: true,
+                capabilities: state.desktop_capabilities.clone(),
+            })
+            .unwrap_or_default(),
+        );
+        let _ = tx.send(msg);
     }
 
     /// Unregister ONE client connection (socket close). Other connections
@@ -1216,13 +1241,49 @@ mod tests {
         };
         broker.register_client("alice", ctx, info).await.unwrap();
 
+        // Registering while the desktop is online replays an online status first.
+        match crx.recv().await.unwrap() {
+            WsMessage::Text(t) => {
+                assert!(t.contains("desktop_status"));
+                assert!(t.contains("true"));
+            }
+            _ => panic!("expected text"),
+        }
+
         broker.unregister_desktop("alice", &dtx).await;
 
-        // Client should receive desktop_status offline
+        // Then the offline notification when the desktop drops.
         match crx.recv().await.unwrap() {
             WsMessage::Text(t) => {
                 assert!(t.contains("desktop_status"));
                 assert!(t.contains("false"));
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_client_join_replays_desktop_capabilities() {
+        let broker = Broker::new();
+        let (dtx, _drx) = test_conn();
+        let caps = Some(vec!["file_upload_v1".to_string()]);
+        broker.register_desktop("alice", dtx, caps).await.unwrap();
+
+        // A client connecting AFTER the desktop must still learn its caps.
+        let (ctx, mut crx) = test_conn();
+        let info = ClientInfo {
+            device_id: "dev-1".into(),
+            device_name: "Phone".into(),
+            ip: "1.2.3.4".into(),
+            connected_at: "now".into(),
+        };
+        broker.register_client("alice", ctx, info).await.unwrap();
+
+        match crx.recv().await.unwrap() {
+            WsMessage::Text(t) => {
+                assert!(t.contains("desktop_status"));
+                assert!(t.contains("true"));
+                assert!(t.contains("file_upload_v1"));
             }
             _ => panic!("expected text"),
         }
