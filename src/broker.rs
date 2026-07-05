@@ -131,9 +131,41 @@ struct ReplayRequest {
     tx: ConnTx,
 }
 
+/// One in-flight client→desktop file upload, governed at the relay so a
+/// misbehaving client can't stream unbounded bytes or leak upload slots.
+struct UploadEntry {
+    /// The exact client CONNECTION that owns this upload. Chunks are only
+    /// forwarded from this connection and the result is routed back to it.
+    owner: ConnTx,
+    /// Size the client declared in `file_upload_begin`.
+    declared_size: u64,
+    /// Payload bytes forwarded to the desktop so far.
+    bytes_forwarded: u64,
+    /// Last time any message touched this upload (for idle GC).
+    last_activity: Instant,
+    /// Set by `file_upload_end`; further chunks are ignored.
+    finished: bool,
+}
+
+/// Outcome of governing a single `PTY_FILE_CHUNK`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChunkDecision {
+    /// Owned by an active upload and within budget — forward to the desktop.
+    Forward,
+    /// No active begin, not owned by this connection, or already finished.
+    Drop,
+    /// Byte budget exceeded — the upload was severed; the caller sends a
+    /// relay-originated failure result to the owner (which is this connection).
+    Overrun,
+}
+
 /// Per-account state tracked by the broker.
 struct AccountState {
     desktop_tx: Option<ConnTx>,
+    /// Features the online desktop advertised at registration.
+    desktop_capabilities: Option<Vec<String>>,
+    /// Active file uploads keyed by upload_id.
+    uploads: HashMap<String, UploadEntry>,
     clients: Vec<ClientConnection>,
     pending_devices: Vec<PendingDevice>,
     /// Connections whose session_list_request has been forwarded to the
@@ -150,6 +182,8 @@ impl AccountState {
     fn new() -> Self {
         Self {
             desktop_tx: None,
+            desktop_capabilities: None,
+            uploads: HashMap::new(),
             clients: Vec::new(),
             pending_devices: Vec::new(),
             replay_queue: VecDeque::new(),
@@ -161,6 +195,12 @@ impl AccountState {
 const MAX_CLIENTS: usize = 10;
 const MAX_TOTAL_CONNECTIONS: usize = 50;
 const MAX_REPLAY_QUEUE: usize = 64;
+/// Hard cap on a single upload's forwarded bytes (also the max declared size).
+const MAX_UPLOAD_SIZE: u64 = 25 * 1024 * 1024;
+/// Max concurrent uploads per account.
+const MAX_ACTIVE_UPLOADS: usize = 8;
+/// Uploads with no activity for this long are garbage-collected.
+const UPLOAD_IDLE_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerError {
@@ -223,6 +263,7 @@ impl Broker {
         &self,
         username: &str,
         tx: ConnTx,
+        capabilities: Option<Vec<String>>,
     ) -> Result<(), BrokerError> {
         let mut accounts = self.accounts.write().await;
         let state = accounts
@@ -236,13 +277,15 @@ impl Broker {
             );
         }
         state.desktop_tx = Some(tx);
+        state.desktop_capabilities = capabilities.clone();
         // Replay bookkeeping belongs to the previous desktop connection.
         state.replay_queue.clear();
         state.replay_target = None;
-        // Notify all clients that desktop came online
+        // Notify all clients that desktop came online, advertising its features.
         let online_msg = WsMessage::Text(
             serde_json::to_string(&crate::protocol::ControlMessage::DesktopStatus {
                 online: true,
+                capabilities,
             })
             .unwrap_or_default(),
         );
@@ -271,12 +314,14 @@ impl Broker {
                 _ => {}
             }
             state.desktop_tx = None;
+            state.desktop_capabilities = None;
             state.replay_queue.clear();
             state.replay_target = None;
             // Notify all clients that desktop went offline
             let offline_msg = WsMessage::Text(
                 serde_json::to_string(&crate::protocol::ControlMessage::DesktopStatus {
                     online: false,
+                    capabilities: None,
                 })
                 .unwrap_or_default(),
             );
@@ -328,6 +373,8 @@ impl Broker {
         if let Some(state) = accounts.get_mut(username) {
             state.clients.retain(|c| !c.tx.same_conn(conn));
             state.replay_queue.retain(|r| !r.tx.same_conn(conn));
+            // Drop any uploads this connection owned so their slots free up.
+            state.uploads.retain(|_, e| !e.owner.same_conn(conn));
             // A mid-burst disconnect leaves replay_target pointing at the
             // gone connection on purpose: the remaining frames of that burst
             // drop harmlessly instead of broadcasting to everyone, and the
@@ -414,6 +461,108 @@ impl Broker {
         let state = accounts.get(username).ok_or(BrokerError::DesktopOffline)?;
         let tx = state.desktop_tx.as_ref().ok_or(BrokerError::DesktopOffline)?;
         tx.send(msg).map_err(|_| BrokerError::SendFailed)
+    }
+
+    /// Drop uploads idle past the timeout. Called lazily on every upload
+    /// message for the account (there is no periodic sweep task).
+    fn gc_uploads(state: &mut AccountState) {
+        let now = Instant::now();
+        state
+            .uploads
+            .retain(|_, e| now.duration_since(e.last_activity).as_secs() < UPLOAD_IDLE_TIMEOUT_SECS);
+    }
+
+    /// Govern a `file_upload_begin`. Returns Ok to forward to the desktop, or
+    /// Err(reason) — the caller then sends a relay-originated failure result to
+    /// the sender and does NOT forward.
+    pub async fn begin_upload(
+        &self,
+        username: &str,
+        upload_id: &str,
+        size: u64,
+        conn: &ConnTx,
+    ) -> Result<(), &'static str> {
+        let mut accounts = self.accounts.write().await;
+        let state = accounts
+            .entry(username.to_string())
+            .or_insert_with(AccountState::new);
+        Self::gc_uploads(state);
+        if size > MAX_UPLOAD_SIZE {
+            return Err("file_too_large");
+        }
+        if state.uploads.len() >= MAX_ACTIVE_UPLOADS {
+            return Err("too_many_uploads");
+        }
+        if state.uploads.contains_key(upload_id) {
+            return Err("duplicate_upload_id");
+        }
+        state.uploads.insert(
+            upload_id.to_string(),
+            UploadEntry {
+                owner: conn.clone(),
+                declared_size: size,
+                bytes_forwarded: 0,
+                last_activity: Instant::now(),
+                finished: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Govern one `PTY_FILE_CHUNK`. See `ChunkDecision`.
+    pub async fn record_upload_chunk(
+        &self,
+        username: &str,
+        upload_id: &str,
+        conn: &ConnTx,
+        payload_len: usize,
+    ) -> ChunkDecision {
+        let mut accounts = self.accounts.write().await;
+        let Some(state) = accounts.get_mut(username) else {
+            return ChunkDecision::Drop;
+        };
+        Self::gc_uploads(state);
+        let Some(entry) = state.uploads.get_mut(upload_id) else {
+            return ChunkDecision::Drop;
+        };
+        if entry.finished || !entry.owner.same_conn(conn) {
+            return ChunkDecision::Drop;
+        }
+        entry.bytes_forwarded += payload_len as u64;
+        entry.last_activity = Instant::now();
+        let budget = entry.declared_size.min(MAX_UPLOAD_SIZE);
+        if entry.bytes_forwarded > budget {
+            state.uploads.remove(upload_id);
+            return ChunkDecision::Overrun;
+        }
+        ChunkDecision::Forward
+    }
+
+    /// Mark an upload finished (from `file_upload_end`). Only the owning
+    /// connection can finish its own upload; the entry lingers until the
+    /// desktop's result arrives so the result can be routed back.
+    pub async fn finish_upload(&self, username: &str, upload_id: &str, conn: &ConnTx) {
+        let mut accounts = self.accounts.write().await;
+        let Some(state) = accounts.get_mut(username) else {
+            return;
+        };
+        Self::gc_uploads(state);
+        if let Some(entry) = state.uploads.get_mut(upload_id) {
+            if entry.owner.same_conn(conn) {
+                entry.finished = true;
+                entry.last_activity = Instant::now();
+            }
+        }
+    }
+
+    /// Resolve a `file_upload_result` from the desktop: remove the upload's
+    /// governance entry and return the owning connection to route the result
+    /// to. None means the owner is gone/unknown — the caller drops the result.
+    pub async fn resolve_upload(&self, username: &str, upload_id: &str) -> Option<ConnTx> {
+        let mut accounts = self.accounts.write().await;
+        let state = accounts.get_mut(username)?;
+        Self::gc_uploads(state);
+        state.uploads.remove(upload_id).map(|e| e.owner)
     }
 
     /// Broadcast a message from the desktop to all connected clients.
@@ -565,7 +714,7 @@ mod tests {
     async fn test_replay_routing_targets_requester() {
         let broker = Broker::new();
         let (dtx, _drx) = test_conn();
-        broker.register_desktop("alice", dtx).await.unwrap();
+        broker.register_desktop("alice", dtx, None).await.unwrap();
 
         let mut txs = Vec::new();
         for (dev, name) in [("dev-1", "Phone"), ("dev-2", "Laptop")] {
@@ -643,13 +792,13 @@ mod tests {
     async fn test_desktop_registration() {
         let broker = Broker::new();
         let (tx, _rx) = test_conn();
-        broker.register_desktop("alice", tx.clone()).await.unwrap();
+        broker.register_desktop("alice", tx.clone(), None).await.unwrap();
         assert!(broker.is_desktop_online("alice").await);
 
         // Second registration wins (last-writer-wins): the stale socket is
         // evicted and the new one takes over — still online, no error.
         let (tx2, _rx2) = test_conn();
-        broker.register_desktop("alice", tx2.clone()).await.unwrap();
+        broker.register_desktop("alice", tx2.clone(), None).await.unwrap();
         assert!(broker.is_desktop_online("alice").await);
 
         // The evicted stale connection's disconnect cleanup must NOT wipe
@@ -660,7 +809,7 @@ mod tests {
         // Unregister by the current connection works, then re-register.
         broker.unregister_desktop("alice", &tx2).await;
         assert!(!broker.is_desktop_online("alice").await);
-        broker.register_desktop("alice", tx).await.unwrap();
+        broker.register_desktop("alice", tx, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -693,7 +842,7 @@ mod tests {
     async fn test_message_routing_to_desktop() {
         let broker = Broker::new();
         let (tx, mut rx) = test_conn();
-        broker.register_desktop("alice", tx).await.unwrap();
+        broker.register_desktop("alice", tx, None).await.unwrap();
 
         broker
             .send_to_desktop("alice", WsMessage::Text("hello".into()))
@@ -892,10 +1041,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_upload_begin_rejects_oversize() {
+        let broker = Broker::new();
+        let (tx, _rx) = test_conn();
+        let err = broker
+            .begin_upload("alice", "u1", MAX_UPLOAD_SIZE + 1, &tx)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "file_too_large");
+    }
+
+    #[tokio::test]
+    async fn test_upload_begin_rejects_ninth_concurrent() {
+        let broker = Broker::new();
+        let (tx, _rx) = test_conn();
+        for i in 0..MAX_ACTIVE_UPLOADS {
+            broker
+                .begin_upload("alice", &format!("u{i}"), 1024, &tx)
+                .await
+                .unwrap();
+        }
+        let err = broker
+            .begin_upload("alice", "u-extra", 1024, &tx)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "too_many_uploads");
+    }
+
+    #[tokio::test]
+    async fn test_upload_begin_rejects_duplicate_id() {
+        let broker = Broker::new();
+        let (tx, _rx) = test_conn();
+        broker.begin_upload("alice", "u1", 1024, &tx).await.unwrap();
+        let err = broker
+            .begin_upload("alice", "u1", 1024, &tx)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "duplicate_upload_id");
+    }
+
+    #[tokio::test]
+    async fn test_chunk_without_begin_is_dropped() {
+        let broker = Broker::new();
+        let (tx, _rx) = test_conn();
+        assert_eq!(
+            broker.record_upload_chunk("alice", "ghost", &tx, 512).await,
+            ChunkDecision::Drop
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chunk_from_non_owner_is_dropped() {
+        let broker = Broker::new();
+        let (owner, _orx) = test_conn();
+        let (other, _xrx) = test_conn();
+        broker.begin_upload("alice", "u1", 4096, &owner).await.unwrap();
+        // A different connection cannot push chunks into someone else's upload.
+        assert_eq!(
+            broker.record_upload_chunk("alice", "u1", &other, 512).await,
+            ChunkDecision::Drop
+        );
+        // The owner's chunk is forwarded.
+        assert_eq!(
+            broker.record_upload_chunk("alice", "u1", &owner, 512).await,
+            ChunkDecision::Forward
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chunk_overrun_severs_upload() {
+        let broker = Broker::new();
+        let (tx, _rx) = test_conn();
+        broker.begin_upload("alice", "u1", 1000, &tx).await.unwrap();
+        // Within budget.
+        assert_eq!(
+            broker.record_upload_chunk("alice", "u1", &tx, 800).await,
+            ChunkDecision::Forward
+        );
+        // Exceeds declared size → overrun; upload state is dropped.
+        assert_eq!(
+            broker.record_upload_chunk("alice", "u1", &tx, 300).await,
+            ChunkDecision::Overrun
+        );
+        // Now there's no active begin — subsequent chunks are dropped.
+        assert_eq!(
+            broker.record_upload_chunk("alice", "u1", &tx, 10).await,
+            ChunkDecision::Drop
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finished_upload_ignores_further_chunks() {
+        let broker = Broker::new();
+        let (tx, _rx) = test_conn();
+        broker.begin_upload("alice", "u1", 4096, &tx).await.unwrap();
+        broker.finish_upload("alice", "u1", &tx).await;
+        assert_eq!(
+            broker.record_upload_chunk("alice", "u1", &tx, 512).await,
+            ChunkDecision::Drop
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upload_result_routes_to_owner_only() {
+        let broker = Broker::new();
+        let (owner, _orx) = test_conn();
+        let (other, _xrx) = test_conn();
+        broker.begin_upload("alice", "u1", 4096, &owner).await.unwrap();
+
+        let routed = broker.resolve_upload("alice", "u1").await.unwrap();
+        assert!(routed.same_conn(&owner));
+        assert!(!routed.same_conn(&other));
+        // Entry is cleared: a second resolve finds nothing.
+        assert!(broker.resolve_upload("alice", "u1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_upload_cleared_when_owner_disconnects() {
+        let broker = Broker::new();
+        let (tx, _rx) = test_conn();
+        let info = ClientInfo {
+            device_id: "dev-1".into(),
+            device_name: "Phone".into(),
+            ip: "1.2.3.4".into(),
+            connected_at: "now".into(),
+        };
+        broker.register_client("alice", tx.clone(), info).await.unwrap();
+        broker.begin_upload("alice", "u1", 4096, &tx).await.unwrap();
+        broker.unregister_client("alice", "dev-1", &tx).await;
+        // The upload slot is freed — the id is no longer active.
+        assert!(broker.resolve_upload("alice", "u1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_desktop_capabilities_reach_client_status() {
+        let broker = Broker::new();
+        let (ctx, mut crx) = test_conn();
+        let info = ClientInfo {
+            device_id: "dev-1".into(),
+            device_name: "Phone".into(),
+            ip: "1.2.3.4".into(),
+            connected_at: "now".into(),
+        };
+        broker.register_client("alice", ctx, info).await.unwrap();
+
+        let (dtx, _drx) = test_conn();
+        broker
+            .register_desktop("alice", dtx, Some(vec!["file_upload".into()]))
+            .await
+            .unwrap();
+
+        match crx.recv().await.unwrap() {
+            WsMessage::Text(t) => {
+                assert!(t.contains("desktop_status"));
+                assert!(t.contains("\"online\":true"));
+                assert!(t.contains("file_upload"));
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_desktop_offline_notification() {
         let broker = Broker::new();
         let (dtx, _drx) = test_conn();
-        broker.register_desktop("alice", dtx.clone()).await.unwrap();
+        broker.register_desktop("alice", dtx.clone(), None).await.unwrap();
 
         let (ctx, mut crx) = test_conn();
         let info = ClientInfo {

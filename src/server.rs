@@ -275,7 +275,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, ip: String) {
                             continue;
                         }
 
-                        handle_binary_message(&data, &role, &state).await;
+                        handle_binary_message(&data, &role, &state, &outbound_tx).await;
                     }
                     Some(Ok(Message::Ping(_))) => {
                         ping_misses = 0;
@@ -391,7 +391,7 @@ async fn handle_control_message(
             .await;
         }
 
-        ControlMessage::DesktopRegister { .. } => {
+        ControlMessage::DesktopRegister { capabilities, .. } => {
             if let ConnectionRole::Unauthenticated = role {
                 // Must authenticate first
                 return;
@@ -400,7 +400,7 @@ async fn handle_control_message(
                 let username = username.clone();
                 match state
                     .broker
-                    .register_desktop(&username, outbound_tx.clone())
+                    .register_desktop(&username, outbound_tx.clone(), capabilities.clone())
                     .await
                 {
                     Ok(()) => {
@@ -438,6 +438,70 @@ async fn handle_control_message(
                     .broker
                     .send_to_desktop(username, WsMessage::Text(json))
                     .await;
+            }
+        }
+
+        // Client announces a file upload. The relay governs it (size / slot /
+        // duplicate limits) before forwarding; a rejection is answered with a
+        // relay-originated failure result to the sender only.
+        ControlMessage::FileUploadBegin { upload_id, size, .. } => {
+            if let ConnectionRole::Client { username, .. } = role {
+                match state
+                    .broker
+                    .begin_upload(username, upload_id, *size, outbound_tx)
+                    .await
+                {
+                    Ok(()) => {
+                        let json = serde_json::to_string(msg).unwrap();
+                        let _ = state
+                            .broker
+                            .send_to_desktop(username, WsMessage::Text(json))
+                            .await;
+                    }
+                    Err(reason) => {
+                        let fail = ControlMessage::FileUploadResult {
+                            upload_id: upload_id.clone(),
+                            ok: false,
+                            path: None,
+                            error: Some(reason.to_string()),
+                        };
+                        let _ = outbound_tx.send(WsMessage::Text(
+                            serde_json::to_string(&fail).unwrap(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Client signals the upload is complete: mark it finished in governance
+        // state and forward to the desktop to finalize the write.
+        ControlMessage::FileUploadEnd { upload_id, .. } => {
+            if let ConnectionRole::Client { username, .. } = role {
+                state.broker.finish_upload(username, upload_id, outbound_tx).await;
+                let json = serde_json::to_string(msg).unwrap();
+                let _ = state
+                    .broker
+                    .send_to_desktop(username, WsMessage::Text(json))
+                    .await;
+            }
+        }
+
+        // Desktop reports an upload outcome: routed to the requesting client
+        // connection only (clearing governance state). Unknown = client gone.
+        ControlMessage::FileUploadResult { upload_id, .. } => {
+            if let ConnectionRole::Desktop { username } = role {
+                match state.broker.resolve_upload(username, upload_id).await {
+                    Some(tx) => {
+                        let json = serde_json::to_string(msg).unwrap();
+                        let _ = tx.send(WsMessage::Text(json));
+                    }
+                    None => {
+                        tracing::debug!(
+                            upload_id = %upload_id,
+                            "file_upload_result for unknown upload; dropping"
+                        );
+                    }
+                }
             }
         }
 
@@ -988,19 +1052,54 @@ async fn handle_auth(
     // The auth_result will be sent when the desktop approves/rejects
 }
 
-async fn handle_binary_message(data: &[u8], role: &ConnectionRole, state: &Arc<AppState>) {
+async fn handle_binary_message(
+    data: &[u8],
+    role: &ConnectionRole,
+    state: &Arc<AppState>,
+    outbound_tx: &ConnTx,
+) {
     match protocol::parse_binary_frame(data) {
-        Ok((frame_type, _session_id, _payload)) => match role {
+        Ok((frame_type, upload_id, payload)) => match role {
             ConnectionRole::Client { username, .. } => {
                 if frame_type == protocol::PTY_INPUT {
                     let _ = state
                         .broker
                         .send_to_desktop(username, WsMessage::Binary(data.to_vec()))
                         .await;
+                } else if frame_type == protocol::PTY_FILE_CHUNK {
+                    // Governed forward: only chunks of an active, owned upload
+                    // that stays within budget reach the desktop.
+                    use crate::broker::ChunkDecision;
+                    match state
+                        .broker
+                        .record_upload_chunk(username, &upload_id, outbound_tx, payload.len())
+                        .await
+                    {
+                        ChunkDecision::Forward => {
+                            let _ = state
+                                .broker
+                                .send_to_desktop(username, WsMessage::Binary(data.to_vec()))
+                                .await;
+                        }
+                        ChunkDecision::Overrun => {
+                            let fail = ControlMessage::FileUploadResult {
+                                upload_id: upload_id.clone(),
+                                ok: false,
+                                path: None,
+                                error: Some("size_exceeded".into()),
+                            };
+                            let _ = outbound_tx.send(WsMessage::Text(
+                                serde_json::to_string(&fail).unwrap(),
+                            ));
+                        }
+                        ChunkDecision::Drop => {}
+                    }
                 }
             }
             ConnectionRole::Desktop { username } => {
-                if frame_type == protocol::PTY_OUTPUT {
+                if frame_type == protocol::PTY_FILE_CHUNK {
+                    tracing::debug!("desktop sent a file chunk; ignoring");
+                } else if frame_type == protocol::PTY_OUTPUT {
                     state
                         .broker
                         .broadcast_to_clients(username, WsMessage::Binary(data.to_vec()))
@@ -1152,5 +1251,172 @@ mod tests {
         assert_eq!(sanitize_for_log("line1\nline2"), "line1_line2");
         assert_eq!(sanitize_for_log("cr\rhere"), "cr_here");
         assert_eq!(sanitize_for_log("null\x00byte"), "null_byte");
+    }
+
+    // --- File upload routing / role-gating ---
+
+    fn test_state() -> Arc<AppState> {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let push = PushManager::init(db.clone()).unwrap();
+        let auth = AuthManager::new(db).unwrap();
+        Arc::new(AppState::new(Broker::new(), auth, push))
+    }
+
+    fn test_conn() -> (ConnTx, mpsc::UnboundedReceiver<WsMessage>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            ConnTx::new(tx, Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+            rx,
+        )
+    }
+
+    fn client_role() -> ConnectionRole {
+        ConnectionRole::Client {
+            username: "alice".into(),
+            device_id: "dev-1".into(),
+        }
+    }
+
+    fn upload_frame(payload: &[u8]) -> (String, Vec<u8>) {
+        let upload_id = "u".repeat(36);
+        let frame = protocol::build_binary_frame(protocol::PTY_FILE_CHUNK, &upload_id, payload);
+        (upload_id, frame)
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_file_chunk_dropped() {
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx, None).await.unwrap();
+
+        let (ctx, _crx) = test_conn();
+        let (_id, frame) = upload_frame(b"data");
+        handle_binary_message(&frame, &ConnectionRole::Unauthenticated, &state, &ctx).await;
+        assert!(drx.try_recv().is_err(), "unauthenticated chunk must not forward");
+    }
+
+    #[tokio::test]
+    async fn test_client_file_chunk_forwarded_after_begin() {
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx, None).await.unwrap();
+
+        let (ctx, _crx) = test_conn();
+        let (upload_id, frame) = upload_frame(b"filedata");
+        state.broker.begin_upload("alice", &upload_id, 4096, &ctx).await.unwrap();
+
+        handle_binary_message(&frame, &client_role(), &state, &ctx).await;
+        match drx.recv().await.unwrap() {
+            WsMessage::Binary(b) => assert_eq!(b, frame),
+            _ => panic!("expected binary forward to desktop"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_client_file_chunk_without_begin_not_forwarded() {
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx, None).await.unwrap();
+
+        let (ctx, _crx) = test_conn();
+        let (_id, frame) = upload_frame(b"x");
+        handle_binary_message(&frame, &client_role(), &state, &ctx).await;
+        assert!(drx.try_recv().is_err(), "chunk without begin must not forward");
+    }
+
+    #[tokio::test]
+    async fn test_client_file_chunk_overrun_sends_failure_and_severs() {
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx, None).await.unwrap();
+
+        let (ctx, mut crx) = test_conn();
+        let (upload_id, frame) = upload_frame(b"way-too-long");
+        // Declared size smaller than the payload → overrun on first chunk.
+        state.broker.begin_upload("alice", &upload_id, 4, &ctx).await.unwrap();
+
+        handle_binary_message(&frame, &client_role(), &state, &ctx).await;
+        // Not forwarded to the desktop.
+        assert!(drx.try_recv().is_err());
+        // Sender gets a relay-originated failure result.
+        match crx.recv().await.unwrap() {
+            WsMessage::Text(t) => {
+                assert!(t.contains("file_upload_result"));
+                assert!(t.contains("size_exceeded"));
+            }
+            _ => panic!("expected failure result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_upload_begin_oversize_rejected_with_result() {
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx, None).await.unwrap();
+
+        let (ctx, mut crx) = test_conn();
+        let mut role = client_role();
+        let begin = ControlMessage::FileUploadBegin {
+            upload_id: "u1".into(),
+            kind: "file".into(),
+            name: "big.bin".into(),
+            size: 26 * 1024 * 1024,
+            mime: "application/octet-stream".into(),
+            session_id: None,
+        };
+        handle_control_message(&begin, &mut role, &state, &ctx, "1.2.3.4").await;
+
+        // Rejected: nothing reaches the desktop.
+        assert!(drx.try_recv().is_err());
+        // Sender gets a failure result.
+        match crx.recv().await.unwrap() {
+            WsMessage::Text(t) => {
+                assert!(t.contains("file_upload_result"));
+                assert!(t.contains("file_too_large"));
+            }
+            _ => panic!("expected failure result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_upload_result_routed_to_owner_only() {
+        let state = test_state();
+        let (owner, mut orx) = test_conn();
+        let (other, mut xrx) = test_conn();
+        let info = |dev: &str| ClientInfo {
+            device_id: dev.into(),
+            device_name: "d".into(),
+            ip: "1.2.3.4".into(),
+            connected_at: "now".into(),
+        };
+        state.broker.register_client("alice", owner.clone(), info("dev-1")).await.unwrap();
+        state.broker.register_client("alice", other.clone(), info("dev-2")).await.unwrap();
+
+        let (dtx, _drx) = test_conn();
+        state.broker.register_desktop("alice", dtx.clone(), None).await.unwrap();
+        // Drain the desktop-online broadcast both clients received.
+        let _ = orx.try_recv();
+        let _ = xrx.try_recv();
+
+        let upload_id = "u".repeat(36);
+        state.broker.begin_upload("alice", &upload_id, 4096, &owner).await.unwrap();
+
+        let mut role = ConnectionRole::Desktop { username: "alice".into() };
+        let result = ControlMessage::FileUploadResult {
+            upload_id: upload_id.clone(),
+            ok: true,
+            path: Some("/tmp/big.bin".into()),
+            error: None,
+        };
+        handle_control_message(&result, &mut role, &state, &dtx, "1.2.3.4").await;
+
+        match orx.recv().await.unwrap() {
+            WsMessage::Text(t) => {
+                assert!(t.contains("file_upload_result"));
+                assert!(t.contains("\"ok\":true"));
+            }
+            _ => panic!("expected result on owner"),
+        }
+        assert!(xrx.try_recv().is_err(), "non-owner must not receive the result");
     }
 }

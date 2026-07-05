@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 pub const PTY_OUTPUT: u8 = 0x01;
 pub const PTY_INPUT: u8 = 0x02;
 pub const PTY_SCROLLBACK: u8 = 0x03;
+/// A chunk of a client→desktop file upload. The 36-byte session-id slot holds
+/// the upload UUID; the payload is a slice of the file bytes.
+pub const PTY_FILE_CHUNK: u8 = 0x04;
 
 /// Binary frame: [1 byte type][36 bytes session UUID as ASCII][N bytes payload]
 pub const BINARY_HEADER_LEN: usize = 1 + 36;
@@ -73,7 +76,13 @@ pub enum ControlMessage {
 
     // --- Desktop registration ---
     #[serde(rename = "desktop_register")]
-    DesktopRegister { version: u32 },
+    DesktopRegister {
+        version: u32,
+        /// Features this desktop supports (e.g. "file_upload"). Absent for old
+        /// desktops that predate capability advertisement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<Vec<String>>,
+    },
     #[serde(rename = "desktop_registered")]
     DesktopRegistered,
 
@@ -201,13 +210,51 @@ pub enum ControlMessage {
     #[serde(rename = "resync_required")]
     ResyncRequired,
 
+    // --- File upload (client → desktop, chunked over binary PTY_FILE_CHUNK) ---
+    /// Client announces an upload; the relay governs it and forwards to the
+    /// desktop. `upload_id` keys the binary chunk stream and the result.
+    #[serde(rename = "file_upload_begin")]
+    FileUploadBegin {
+        upload_id: String,
+        kind: String,
+        name: String,
+        size: u64,
+        mime: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    /// Client signals all chunks sent; forwarded to the desktop to finalize.
+    #[serde(rename = "file_upload_end")]
+    FileUploadEnd {
+        upload_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    /// Desktop (or the relay, on rejection) reports the outcome; routed to the
+    /// requesting client connection only.
+    #[serde(rename = "file_upload_result")]
+    FileUploadResult {
+        upload_id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
     // --- Health ---
     #[serde(rename = "ping")]
     Ping,
     #[serde(rename = "pong")]
     Pong,
     #[serde(rename = "desktop_status")]
-    DesktopStatus { online: bool },
+    DesktopStatus {
+        online: bool,
+        /// Features the online desktop advertised at registration. None when
+        /// offline or when an old desktop registered without capabilities.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<Vec<String>>,
+    },
     #[serde(rename = "relay_shutting_down")]
     RelayShuttingDown,
 
@@ -237,7 +284,7 @@ pub fn parse_binary_frame(data: &[u8]) -> Result<(u8, String, &[u8]), ProtocolEr
         });
     }
     let frame_type = data[0];
-    if !matches!(frame_type, PTY_OUTPUT | PTY_INPUT | PTY_SCROLLBACK) {
+    if !matches!(frame_type, PTY_OUTPUT | PTY_INPUT | PTY_SCROLLBACK | PTY_FILE_CHUNK) {
         return Err(ProtocolError::UnknownFrameType(frame_type));
     }
     let id_bytes = &data[1..37];
@@ -386,6 +433,117 @@ mod tests {
             }
             _ => panic!("expected SessionList"),
         }
+    }
+
+    #[test]
+    fn test_file_chunk_frame_roundtrips() {
+        let upload_id = uuid::Uuid::new_v4().to_string();
+        let payload = b"file bytes";
+        let frame = build_binary_frame(PTY_FILE_CHUNK, &upload_id, payload);
+        let (ftype, id, data) = parse_binary_frame(&frame).unwrap();
+        assert_eq!(ftype, PTY_FILE_CHUNK);
+        assert_eq!(id, upload_id);
+        assert_eq!(data, payload);
+    }
+
+    #[test]
+    fn test_desktop_register_with_capabilities_roundtrips() {
+        let msg = ControlMessage::DesktopRegister {
+            version: 1,
+            capabilities: Some(vec!["file_upload".into()]),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"capabilities\":[\"file_upload\"]"));
+        let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ControlMessage::DesktopRegister { capabilities, .. } => {
+                assert_eq!(capabilities.unwrap(), vec!["file_upload".to_string()]);
+            }
+            _ => panic!("expected DesktopRegister"),
+        }
+    }
+
+    #[test]
+    fn test_old_desktop_register_without_capabilities_parses() {
+        // Old desktops omit the field entirely — serde default fills None.
+        let json = r#"{"type":"desktop_register","version":1}"#;
+        let msg: ControlMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMessage::DesktopRegister { version, capabilities } => {
+                assert_eq!(version, 1);
+                assert!(capabilities.is_none());
+            }
+            _ => panic!("expected DesktopRegister"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_begin_wire_shape() {
+        let json = r#"{"type":"file_upload_begin","upload_id":"u1","kind":"image","name":"a.png","size":1024,"mime":"image/png","session_id":"s1"}"#;
+        let msg: ControlMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMessage::FileUploadBegin {
+                upload_id,
+                kind,
+                name,
+                size,
+                mime,
+                session_id,
+            } => {
+                assert_eq!(upload_id, "u1");
+                assert_eq!(kind, "image");
+                assert_eq!(name, "a.png");
+                assert_eq!(size, 1024);
+                assert_eq!(mime, "image/png");
+                assert_eq!(session_id.unwrap(), "s1");
+            }
+            _ => panic!("expected FileUploadBegin"),
+        }
+        // session_id is optional.
+        let no_sid = r#"{"type":"file_upload_begin","upload_id":"u2","kind":"file","name":"b","size":1,"mime":"text/plain"}"#;
+        let parsed: ControlMessage = serde_json::from_str(no_sid).unwrap();
+        assert!(matches!(
+            parsed,
+            ControlMessage::FileUploadBegin { session_id: None, .. }
+        ));
+    }
+
+    #[test]
+    fn test_file_upload_result_roundtrips() {
+        let msg = ControlMessage::FileUploadResult {
+            upload_id: "u1".into(),
+            ok: false,
+            path: None,
+            error: Some("file_too_large".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"file_upload_result\""));
+        assert!(json.contains("\"upload_id\":\"u1\""));
+        let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ControlMessage::FileUploadResult { ok, error, .. } => {
+                assert!(!ok);
+                assert_eq!(error.unwrap(), "file_too_large");
+            }
+            _ => panic!("expected FileUploadResult"),
+        }
+    }
+
+    #[test]
+    fn test_desktop_status_carries_capabilities() {
+        let msg = ControlMessage::DesktopStatus {
+            online: true,
+            capabilities: Some(vec!["file_upload".into()]),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"capabilities\":[\"file_upload\"]"));
+        // Offline omits capabilities entirely (skip_serializing_if None).
+        let offline = ControlMessage::DesktopStatus {
+            online: false,
+            capabilities: None,
+        };
+        let json = serde_json::to_string(&offline).unwrap();
+        assert!(!json.contains("capabilities"));
     }
 
     #[test]
