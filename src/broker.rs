@@ -120,19 +120,30 @@ pub struct PendingDevice {
     pub client_tx: ConnTx,
 }
 
+/// A queued replay request: the exact connection that asked for the session
+/// list. Routing by connection (not device) matters — two tabs can share a
+/// device_id, and delivering a burst to the non-requesting twin would feed
+/// its open scrollback gate a replay whose terminating session_list it never
+/// consumes, deadlocking its live output.
+#[derive(Clone)]
+struct ReplayRequest {
+    device_id: String,
+    tx: ConnTx,
+}
+
 /// Per-account state tracked by the broker.
 struct AccountState {
     desktop_tx: Option<ConnTx>,
     clients: Vec<ClientConnection>,
     pending_devices: Vec<PendingDevice>,
-    /// device_ids whose session_list_request has been forwarded to the
+    /// Connections whose session_list_request has been forwarded to the
     /// desktop, in order. The desktop answers requests sequentially and
     /// prefixes each reply burst with replay_begin, so the front of this
-    /// queue is the client the next burst belongs to.
-    replay_queue: VecDeque<String>,
-    /// Client currently receiving a replay burst (scrollback frames up to
-    /// the trailing session_list). None = broadcast (old desktop fallback).
-    replay_target: Option<String>,
+    /// queue is the connection the next burst belongs to.
+    replay_queue: VecDeque<ReplayRequest>,
+    /// Connection currently receiving a replay burst (scrollback frames up
+    /// to the trailing session_list). None = broadcast (old desktop fallback).
+    replay_target: Option<ReplayRequest>,
 }
 
 impl AccountState {
@@ -312,18 +323,13 @@ impl Broker {
 
     /// Unregister ONE client connection (socket close). Other connections
     /// from the same device stay registered.
-    pub async fn unregister_client(&self, username: &str, device_id: &str, conn: &ConnTx) {
+    pub async fn unregister_client(&self, username: &str, _device_id: &str, conn: &ConnTx) {
         let mut accounts = self.accounts.write().await;
         if let Some(state) = accounts.get_mut(username) {
             state.clients.retain(|c| !c.tx.same_conn(conn));
-            // Queued replays are keyed by device_id: drop them only when no
-            // connection of that device remains (a surviving twin may be the
-            // requester; a stray burst to it drops at its closed gate).
-            if !state.clients.iter().any(|c| c.info.device_id == device_id) {
-                state.replay_queue.retain(|d| d != device_id);
-            }
+            state.replay_queue.retain(|r| !r.tx.same_conn(conn));
             // A mid-burst disconnect leaves replay_target pointing at the
-            // gone device on purpose: the remaining frames of that burst
+            // gone connection on purpose: the remaining frames of that burst
             // drop harmlessly instead of broadcasting to everyone, and the
             // trailing session_list clears the target.
         }
@@ -335,14 +341,13 @@ impl Broker {
         let mut accounts = self.accounts.write().await;
         if let Some(state) = accounts.get_mut(username) {
             state.clients.retain(|c| c.info.device_id != device_id);
-            state.replay_queue.retain(|d| d != device_id);
+            state.replay_queue.retain(|r| r.device_id != device_id);
         }
     }
 
-    /// A client requested the session list: queue it for targeted replay
-    /// routing and let its live output flow again (the replay it just asked
-    /// for is the convergence point). `conn` pins the dirty-clear to the
-    /// requesting connection rather than a same-device twin.
+    /// A client requested the session list: queue its CONNECTION for targeted
+    /// replay routing and let its live output flow again (the replay it just
+    /// asked for is the convergence point).
     pub async fn note_session_list_request(
         &self,
         username: &str,
@@ -352,11 +357,12 @@ impl Broker {
         let mut accounts = self.accounts.write().await;
         if let Some(state) = accounts.get_mut(username) {
             if state.replay_queue.len() < MAX_REPLAY_QUEUE {
-                state.replay_queue.push_back(device_id.to_string());
+                state.replay_queue.push_back(ReplayRequest {
+                    device_id: device_id.to_string(),
+                    tx: conn.clone(),
+                });
             }
-            if let Some(client) = state.clients.iter().find(|c| c.tx.same_conn(conn)) {
-                client.tx.clear_dirty();
-            }
+            conn.clear_dirty();
         }
     }
 
@@ -369,17 +375,23 @@ impl Broker {
         }
     }
 
-    /// The session_list that terminates a replay burst: returns the device to
-    /// route it to (clearing the target), or None to broadcast.
-    pub async fn end_replay(&self, username: &str) -> Option<String> {
+    /// The session_list that terminates a replay burst: returns the exact
+    /// connection to route it to (clearing the target), or None to broadcast.
+    pub async fn end_replay(&self, username: &str) -> Option<ConnTx> {
         let mut accounts = self.accounts.write().await;
-        accounts.get_mut(username)?.replay_target.take()
+        Some(accounts.get_mut(username)?.replay_target.take()?.tx)
     }
 
-    /// Current replay-burst recipient, if any.
-    pub async fn replay_target(&self, username: &str) -> Option<String> {
+    /// Connection currently receiving a replay burst, if any.
+    pub async fn replay_target(&self, username: &str) -> Option<ConnTx> {
         let accounts = self.accounts.read().await;
-        accounts.get(username)?.replay_target.clone()
+        Some(accounts.get(username)?.replay_target.as_ref()?.tx.clone())
+    }
+
+    /// Device id of the current replay target (diagnostics/tests).
+    pub async fn replay_target_device(&self, username: &str) -> Option<String> {
+        let accounts = self.accounts.read().await;
+        Some(accounts.get(username)?.replay_target.as_ref()?.device_id.clone())
     }
 
     /// Check if a desktop is connected for a given account.
@@ -569,24 +581,32 @@ mod tests {
 
         // No request queued: replay falls back to broadcast (None target).
         broker.begin_replay("alice").await;
-        assert_eq!(broker.replay_target("alice").await, None);
+        assert!(broker.replay_target("alice").await.is_none());
 
-        // dev-2 asks for the list; the next burst belongs to it.
+        // dev-2 asks for the list; the next burst belongs to its CONNECTION.
         broker.note_session_list_request("alice", "dev-2", &txs[1]).await;
         broker.begin_replay("alice").await;
-        assert_eq!(broker.replay_target("alice").await.as_deref(), Some("dev-2"));
+        assert_eq!(
+            broker.replay_target_device("alice").await.as_deref(),
+            Some("dev-2")
+        );
+        assert!(broker
+            .replay_target("alice")
+            .await
+            .unwrap()
+            .same_conn(&txs[1]));
 
         // The trailing session_list consumes the target.
-        assert_eq!(broker.end_replay("alice").await.as_deref(), Some("dev-2"));
-        assert_eq!(broker.replay_target("alice").await, None);
+        assert!(broker.end_replay("alice").await.unwrap().same_conn(&txs[1]));
+        assert!(broker.replay_target("alice").await.is_none());
 
         // Two queued requests resolve in FIFO order.
         broker.note_session_list_request("alice", "dev-1", &txs[0]).await;
         broker.note_session_list_request("alice", "dev-2", &txs[1]).await;
         broker.begin_replay("alice").await;
-        assert_eq!(broker.end_replay("alice").await.as_deref(), Some("dev-1"));
+        assert!(broker.end_replay("alice").await.unwrap().same_conn(&txs[0]));
         broker.begin_replay("alice").await;
-        assert_eq!(broker.end_replay("alice").await.as_deref(), Some("dev-2"));
+        assert!(broker.end_replay("alice").await.unwrap().same_conn(&txs[1]));
     }
 
     #[tokio::test]

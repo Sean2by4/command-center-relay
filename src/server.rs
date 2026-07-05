@@ -507,11 +507,8 @@ async fn handle_control_message(
             if let ConnectionRole::Desktop { username } = role {
                 let json = serde_json::to_string(msg).unwrap();
                 match state.broker.end_replay(username).await {
-                    Some(device_id) => {
-                        let _ = state
-                            .broker
-                            .send_to_client(username, &device_id, WsMessage::Text(json))
-                            .await;
+                    Some(tx) => {
+                        let _ = tx.send(WsMessage::Text(json));
                     }
                     None => {
                         state
@@ -1013,15 +1010,8 @@ async fn handle_binary_message(data: &[u8], role: &ConnectionRole, state: &Arc<A
                     // started this burst (replay_begin); broadcast only for
                     // old desktops that don't tag bursts.
                     match state.broker.replay_target(username).await {
-                        Some(device_id) => {
-                            let _ = state
-                                .broker
-                                .send_to_client(
-                                    username,
-                                    &device_id,
-                                    WsMessage::Binary(data.to_vec()),
-                                )
-                                .await;
+                        Some(tx) => {
+                            let _ = tx.send(WsMessage::Binary(data.to_vec()));
                         }
                         None => {
                             state
