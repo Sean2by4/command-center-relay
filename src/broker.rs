@@ -389,6 +389,7 @@ impl Broker {
     }
 
     /// Device id of the current replay target (diagnostics/tests).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn replay_target_device(&self, username: &str) -> Option<String> {
         let accounts = self.accounts.read().await;
         Some(accounts.get(username)?.replay_target.as_ref()?.device_id.clone())
