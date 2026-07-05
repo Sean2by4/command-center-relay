@@ -313,7 +313,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, ip: String) {
             username,
             device_id,
         } => {
-            state.broker.unregister_client(username, device_id).await;
+            state
+                .broker
+                .unregister_client(username, device_id, &outbound_tx)
+                .await;
             audit::log_audit(
                 state.auth.db(),
                 AuditEvent::ClientDisconnected,
@@ -445,7 +448,7 @@ async fn handle_control_message(
             if let ConnectionRole::Client { username, device_id } = role {
                 state
                     .broker
-                    .note_session_list_request(username, device_id)
+                    .note_session_list_request(username, device_id, outbound_tx)
                     .await;
                 let json = serde_json::to_string(msg).unwrap();
                 let _ = state
@@ -724,7 +727,7 @@ async fn handle_control_message(
                         WsMessage::Text(serde_json::to_string(&revoked_msg).unwrap()),
                     )
                     .await;
-                state.broker.unregister_client(username, device_id).await;
+                state.broker.unregister_device(username, device_id).await;
                 let _ = device::revoke_device(state.auth.db(), device_id);
                 audit::log_audit(
                     state.auth.db(),

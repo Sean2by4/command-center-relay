@@ -281,8 +281,13 @@ impl Broker {
         }
     }
 
-    /// Register a client connection. If a client with the same device_id
-    /// already exists (e.g. re-auth after approval), update its sender.
+    /// Register a client connection, keyed by the CONNECTION, not device_id.
+    ///
+    /// Re-registering the same socket (re-auth after approval) updates in
+    /// place. A second connection from the same device (two PWA tabs, browser
+    /// tab + installed PWA) coexists — device-keyed replacement silently
+    /// evicted the older tab from the output fan-out while its socket stayed
+    /// open: input kept working, output went permanently dead.
     pub async fn register_client(
         &self,
         username: &str,
@@ -293,7 +298,7 @@ impl Broker {
         let state = accounts
             .entry(username.to_string())
             .or_insert_with(AccountState::new);
-        if let Some(existing) = state.clients.iter_mut().find(|c| c.info.device_id == info.device_id) {
+        if let Some(existing) = state.clients.iter_mut().find(|c| c.tx.same_conn(&tx)) {
             existing.tx = tx;
             existing.info = info;
             return Ok(());
@@ -305,12 +310,18 @@ impl Broker {
         Ok(())
     }
 
-    /// Unregister a client connection by device_id.
-    pub async fn unregister_client(&self, username: &str, device_id: &str) {
+    /// Unregister ONE client connection (socket close). Other connections
+    /// from the same device stay registered.
+    pub async fn unregister_client(&self, username: &str, device_id: &str, conn: &ConnTx) {
         let mut accounts = self.accounts.write().await;
         if let Some(state) = accounts.get_mut(username) {
-            state.clients.retain(|c| c.info.device_id != device_id);
-            state.replay_queue.retain(|d| d != device_id);
+            state.clients.retain(|c| !c.tx.same_conn(conn));
+            // Queued replays are keyed by device_id: drop them only when no
+            // connection of that device remains (a surviving twin may be the
+            // requester; a stray burst to it drops at its closed gate).
+            if !state.clients.iter().any(|c| c.info.device_id == device_id) {
+                state.replay_queue.retain(|d| d != device_id);
+            }
             // A mid-burst disconnect leaves replay_target pointing at the
             // gone device on purpose: the remaining frames of that burst
             // drop harmlessly instead of broadcasting to everyone, and the
@@ -318,16 +329,32 @@ impl Broker {
         }
     }
 
+    /// Remove EVERY connection of a device (revocation) — unlike socket
+    /// cleanup, this is device-scoped by design.
+    pub async fn unregister_device(&self, username: &str, device_id: &str) {
+        let mut accounts = self.accounts.write().await;
+        if let Some(state) = accounts.get_mut(username) {
+            state.clients.retain(|c| c.info.device_id != device_id);
+            state.replay_queue.retain(|d| d != device_id);
+        }
+    }
+
     /// A client requested the session list: queue it for targeted replay
     /// routing and let its live output flow again (the replay it just asked
-    /// for is the convergence point).
-    pub async fn note_session_list_request(&self, username: &str, device_id: &str) {
+    /// for is the convergence point). `conn` pins the dirty-clear to the
+    /// requesting connection rather than a same-device twin.
+    pub async fn note_session_list_request(
+        &self,
+        username: &str,
+        device_id: &str,
+        conn: &ConnTx,
+    ) {
         let mut accounts = self.accounts.write().await;
         if let Some(state) = accounts.get_mut(username) {
             if state.replay_queue.len() < MAX_REPLAY_QUEUE {
                 state.replay_queue.push_back(device_id.to_string());
             }
-            if let Some(client) = state.clients.iter().find(|c| c.info.device_id == device_id) {
+            if let Some(client) = state.clients.iter().find(|c| c.tx.same_conn(conn)) {
                 client.tx.clear_dirty();
             }
         }
@@ -429,7 +456,9 @@ impl Broker {
         });
     }
 
-    /// Send a message to a specific client by device_id.
+    /// Send a message to every connection of a device. Multiple connections
+    /// can share a device_id (two tabs on one device); each gates or handles
+    /// the message itself. Ok when at least one delivery succeeded.
     pub async fn send_to_client(
         &self,
         username: &str,
@@ -438,12 +467,17 @@ impl Broker {
     ) -> Result<(), BrokerError> {
         let accounts = self.accounts.read().await;
         let state = accounts.get(username).ok_or(BrokerError::SendFailed)?;
-        let client = state
-            .clients
-            .iter()
-            .find(|c| c.info.device_id == device_id)
-            .ok_or(BrokerError::SendFailed)?;
-        client.tx.send(msg).map_err(|_| BrokerError::SendFailed)
+        let mut delivered = false;
+        for client in state.clients.iter().filter(|c| c.info.device_id == device_id) {
+            if client.tx.send(msg.clone()).is_ok() {
+                delivered = true;
+            }
+        }
+        if delivered {
+            Ok(())
+        } else {
+            Err(BrokerError::SendFailed)
+        }
     }
 
     /// Add a pending device approval request.
@@ -470,13 +504,20 @@ impl Broker {
         Some(state.pending_devices.remove(idx))
     }
 
-    /// Get info about all connected clients for an account.
+    /// Get info about all connected clients for an account, deduped by
+    /// device_id (two tabs on one device are still one device to the user).
     pub async fn get_connected_clients(&self, username: &str) -> Vec<ClientInfo> {
         let accounts = self.accounts.read().await;
-        accounts
-            .get(username)
-            .map(|s| s.clients.iter().map(|c| c.info.clone()).collect())
-            .unwrap_or_default()
+        let Some(state) = accounts.get(username) else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        state
+            .clients
+            .iter()
+            .filter(|c| seen.insert(c.info.device_id.clone()))
+            .map(|c| c.info.clone())
+            .collect()
     }
 
     /// Send a shutdown message to all connections.
@@ -513,6 +554,7 @@ mod tests {
         let (dtx, _drx) = test_conn();
         broker.register_desktop("alice", dtx).await.unwrap();
 
+        let mut txs = Vec::new();
         for (dev, name) in [("dev-1", "Phone"), ("dev-2", "Laptop")] {
             let (tx, _rx) = test_conn();
             let info = ClientInfo {
@@ -521,7 +563,8 @@ mod tests {
                 ip: "1.2.3.4".into(),
                 connected_at: "now".into(),
             };
-            broker.register_client("alice", tx, info).await.unwrap();
+            broker.register_client("alice", tx.clone(), info).await.unwrap();
+            txs.push(tx);
         }
 
         // No request queued: replay falls back to broadcast (None target).
@@ -529,7 +572,7 @@ mod tests {
         assert_eq!(broker.replay_target("alice").await, None);
 
         // dev-2 asks for the list; the next burst belongs to it.
-        broker.note_session_list_request("alice", "dev-2").await;
+        broker.note_session_list_request("alice", "dev-2", &txs[1]).await;
         broker.begin_replay("alice").await;
         assert_eq!(broker.replay_target("alice").await.as_deref(), Some("dev-2"));
 
@@ -538,8 +581,8 @@ mod tests {
         assert_eq!(broker.replay_target("alice").await, None);
 
         // Two queued requests resolve in FIFO order.
-        broker.note_session_list_request("alice", "dev-1").await;
-        broker.note_session_list_request("alice", "dev-2").await;
+        broker.note_session_list_request("alice", "dev-1", &txs[0]).await;
+        broker.note_session_list_request("alice", "dev-2", &txs[1]).await;
         broker.begin_replay("alice").await;
         assert_eq!(broker.end_replay("alice").await.as_deref(), Some("dev-1"));
         broker.begin_replay("alice").await;
@@ -744,11 +787,87 @@ mod tests {
             ip: "1.2.3.4".into(),
             connected_at: "now".into(),
         };
-        broker.register_client("alice", tx, info).await.unwrap();
+        broker.register_client("alice", tx.clone(), info).await.unwrap();
         assert_eq!(broker.get_connected_clients("alice").await.len(), 1);
 
-        broker.unregister_client("alice", "dev-1").await;
+        broker.unregister_client("alice", "dev-1", &tx).await;
         assert_eq!(broker.get_connected_clients("alice").await.len(), 0);
+    }
+
+    /// Two connections from the SAME device (two PWA tabs) must coexist:
+    /// device-keyed replacement used to evict the older tab from the output
+    /// fan-out (input kept working, output went permanently dead) and the
+    /// newer tab's disconnect then wiped the survivor's registration.
+    #[tokio::test]
+    async fn test_same_device_twin_connections() {
+        let broker = Broker::new();
+        let (tx1, mut rx1) = test_conn();
+        let (tx2, mut rx2) = test_conn();
+        let info = |name: &str| ClientInfo {
+            device_id: "dev-1".into(),
+            device_name: name.into(),
+            ip: "1.2.3.4".into(),
+            connected_at: "now".into(),
+        };
+
+        broker.register_client("alice", tx1.clone(), info("Tab A")).await.unwrap();
+        broker.register_client("alice", tx2.clone(), info("Tab B")).await.unwrap();
+
+        // Both connections receive broadcasts.
+        broker
+            .broadcast_to_clients("alice", WsMessage::Text("update".into()))
+            .await;
+        assert!(rx1.try_recv().is_ok(), "tab A must still receive output");
+        assert!(rx2.try_recv().is_ok(), "tab B must receive output");
+
+        // Device-targeted sends reach both tabs.
+        broker
+            .send_to_client("alice", "dev-1", WsMessage::Text("targeted".into()))
+            .await
+            .unwrap();
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_ok());
+
+        // The device list shows ONE device, not two.
+        assert_eq!(broker.get_connected_clients("alice").await.len(), 1);
+
+        // Tab B closing must not deregister Tab A.
+        broker.unregister_client("alice", "dev-1", &tx2).await;
+        broker
+            .broadcast_to_clients("alice", WsMessage::Text("after-close".into()))
+            .await;
+        assert!(rx1.try_recv().is_ok(), "tab A must survive tab B's close");
+
+        // Revocation is device-scoped: removes every remaining connection.
+        broker.unregister_device("alice", "dev-1").await;
+        assert_eq!(broker.get_connected_clients("alice").await.len(), 0);
+    }
+
+    /// Re-registering the SAME connection (re-auth after device approval)
+    /// must update in place, not create a duplicate entry.
+    #[tokio::test]
+    async fn test_same_conn_reregistration_updates_in_place() {
+        let broker = Broker::new();
+        let (tx, mut rx) = test_conn();
+        let info = |name: &str| ClientInfo {
+            device_id: "dev-1".into(),
+            device_name: name.into(),
+            ip: "1.2.3.4".into(),
+            connected_at: "now".into(),
+        };
+        broker.register_client("alice", tx.clone(), info("Pending")).await.unwrap();
+        broker.register_client("alice", tx.clone(), info("Approved")).await.unwrap();
+
+        let clients = broker.get_connected_clients("alice").await;
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].device_name, "Approved");
+
+        // One broadcast → exactly one delivery.
+        broker
+            .broadcast_to_clients("alice", WsMessage::Text("once".into()))
+            .await;
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "duplicate registration would double-send");
     }
 
     #[tokio::test]
