@@ -8,9 +8,9 @@ use crate::device;
 use crate::protocol::{self, ControlMessage};
 use crate::push::PushManager;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
-use axum::http::{HeaderValue, StatusCode};
-use axum::response::IntoResponse;
+use axum::extract::{ConnectInfo, Path, Query, State, WebSocketUpgrade};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Router;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -86,6 +86,11 @@ pub fn build_router(state: Arc<AppState>, static_dir: PathBuf) -> Router {
     Router::new()
         .route("/health", axum::routing::get(health_handler))
         .route("/ws", axum::routing::get(ws_handler))
+        .route("/bug-reports", axum::routing::get(list_bug_reports_handler))
+        .route(
+            "/bug-reports/{id}/screenshot",
+            axum::routing::get(bug_report_screenshot_handler),
+        )
         .fallback_service(serve_dir)
         .layer(cors)
         .layer(SetResponseHeaderLayer::overriding(
@@ -110,6 +115,122 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "version": env!("CARGO_PKG_VERSION"),
         "connections": connections,
     }))
+}
+
+/// Validate a `Authorization: Bearer <jwt>` header and return the authenticated
+/// username (JWT `sub`). The JWT is the same 24h token a phone/desktop client
+/// receives in its AuthResult and re-presents as `device_token` on the WS path;
+/// we reuse the exact same validation. Any failure maps to 401.
+fn authenticate_bearer(state: &AppState, headers: &HeaderMap) -> Result<String, StatusCode> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let claims = state
+        .auth
+        .validate_jwt(token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    // Mirror the WS reconnect path: a valid JWT from a revoked (deleted)
+    // device must not keep working for the rest of its 24h lifetime.
+    if !device::is_device_registered(state.auth.db(), &claims.device_id, &claims.sub) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(claims.sub)
+}
+
+/// Clamp a requested `?limit=` to the API bounds: default 50, hard cap 500.
+fn clamp_limit(requested: Option<usize>) -> usize {
+    requested.unwrap_or(50).clamp(1, 500)
+}
+
+#[derive(serde::Deserialize)]
+struct BugReportListQuery {
+    limit: Option<usize>,
+}
+
+/// Wire shape for a listed bug report. Deliberately omits `username`
+/// (single-tenant) and the server-internal `screenshot_path`.
+#[derive(serde::Serialize)]
+struct BugReportView {
+    id: i64,
+    device_id: String,
+    device_name: Option<String>,
+    text: String,
+    created_at: String,
+    app_version: Option<String>,
+    has_screenshot: bool,
+}
+
+/// GET /bug-reports — newest-first JSON list for the authenticated account.
+async fn list_bug_reports_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<BugReportListQuery>,
+) -> Response {
+    let username = match authenticate_bearer(&state, &headers) {
+        Ok(u) => u,
+        Err(code) => return code.into_response(),
+    };
+    let limit = clamp_limit(query.limit);
+    match state.auth.db().list_bug_reports(&username, limit) {
+        Ok(reports) => {
+            let views: Vec<BugReportView> = reports
+                .into_iter()
+                .map(|r| BugReportView {
+                    id: r.id,
+                    device_id: r.device_id,
+                    device_name: r.device_name,
+                    text: r.text,
+                    created_at: r.created_at,
+                    app_version: r.app_version,
+                    has_screenshot: r.screenshot_path.is_some(),
+                })
+                .collect();
+            axum::Json(views).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to list bug reports");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// GET /bug-reports/{id}/screenshot — streams the stored PNG. 404 when the row
+/// is missing/foreign, carries no screenshot, or the file is gone. The path is
+/// taken strictly from the DB row; the client only supplies the integer id.
+async fn bug_report_screenshot_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    let username = match authenticate_bearer(&state, &headers) {
+        Ok(u) => u,
+        Err(code) => return code.into_response(),
+    };
+    let report = match state.auth.db().get_bug_report(&username, id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to load bug report");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let path = match report.screenshot_path {
+        Some(p) => p,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("image/png"),
+            )],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn ws_handler(
@@ -1922,5 +2043,280 @@ mod tests {
             }
             _ => panic!("expected capacity error"),
         }
+    }
+
+    // --- Bug report read API (BR-P3) ---
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    async fn response_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Write a PNG file under the state's data dir and return its absolute path.
+    fn write_screenshot(state: &AppState, bytes: &[u8]) -> String {
+        let dir = state.data_dir.join("bug-reports");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&path, bytes).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn test_clamp_limit() {
+        assert_eq!(clamp_limit(None), 50);
+        assert_eq!(clamp_limit(Some(10)), 10);
+        assert_eq!(clamp_limit(Some(1000)), 500);
+        assert_eq!(clamp_limit(Some(0)), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_bug_reports_requires_auth() {
+        let state = test_state();
+        // No Authorization header.
+        let resp = list_bug_reports_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(BugReportListQuery { limit: None }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Malformed token.
+        let resp = list_bug_reports_handler(
+            State(state.clone()),
+            bearer_headers("not-a-jwt"),
+            Query(BugReportListQuery { limit: None }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_revoked_device_jwt_rejected() {
+        let state = test_state();
+        let db = state.auth.db();
+        db.create_account("alice", "hash", None, None).unwrap();
+        db.add_device("dev-1", "alice", "Pixel 9", None).unwrap();
+        db.insert_bug_report("alice", "dev-1", "report", None, None).unwrap();
+
+        // A registered device's JWT works.
+        let token = state.auth.create_jwt("alice", "dev-1").unwrap();
+        let resp = list_bug_reports_handler(
+            State(state.clone()),
+            bearer_headers(&token),
+            Query(BugReportListQuery { limit: None }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Revocation must invalidate the still-unexpired JWT, matching the WS
+        // reconnect path.
+        device::revoke_device(db, "dev-1").unwrap();
+        let resp = list_bug_reports_handler(
+            State(state.clone()),
+            bearer_headers(&token),
+            Query(BugReportListQuery { limit: None }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp =
+            bug_report_screenshot_handler(State(state.clone()), bearer_headers(&token), Path(1))
+                .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_screenshot_requires_auth() {
+        let state = test_state();
+        let resp =
+            bug_report_screenshot_handler(State(state.clone()), HeaderMap::new(), Path(1)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp =
+            bug_report_screenshot_handler(State(state.clone()), bearer_headers("bad"), Path(1))
+                .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_list_bug_reports_newest_first_and_scoped() {
+        let state = test_state();
+        let db = state.auth.db();
+        db.create_account("alice", "hash", None, None).unwrap();
+        db.add_device("dev-1", "alice", "Pixel 9", None).unwrap();
+        db.create_account("bob", "hash", None, None).unwrap();
+        db.add_device("dev-b", "bob", "iPhone", None).unwrap();
+
+        let shot = write_screenshot(&state, b"\x89PNG-list");
+        db.insert_bug_report("alice", "dev-1", "first", None, None).unwrap();
+        db.insert_bug_report("alice", "dev-1", "second", Some(&shot), Some("1.2.3"))
+            .unwrap();
+        // A different account's report must never appear.
+        db.insert_bug_report("bob", "dev-b", "bob-report", None, None).unwrap();
+
+        let token = state.auth.create_jwt("alice", "dev-1").unwrap();
+        let resp = list_bug_reports_handler(
+            State(state.clone()),
+            bearer_headers(&token),
+            Query(BugReportListQuery { limit: None }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_json(resp).await;
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "only alice's reports, bob excluded");
+
+        // Newest first: "second" precedes "first".
+        assert_eq!(arr[0]["text"], "second");
+        assert_eq!(arr[0]["has_screenshot"], true);
+        assert_eq!(arr[0]["app_version"], "1.2.3");
+        assert_eq!(arr[0]["device_name"], "Pixel 9");
+        assert!(arr[0].get("username").is_none(), "username must not leak");
+        assert!(
+            arr[0].get("screenshot_path").is_none(),
+            "internal path must not leak"
+        );
+
+        assert_eq!(arr[1]["text"], "first");
+        assert_eq!(arr[1]["has_screenshot"], false);
+        assert!(arr[1]["app_version"].is_null());
+
+        let _ = std::fs::remove_file(&shot);
+    }
+
+    #[tokio::test]
+    async fn test_list_bug_reports_respects_limit() {
+        let state = test_state();
+        let db = state.auth.db();
+        db.create_account("alice", "hash", None, None).unwrap();
+        db.add_device("dev-1", "alice", "Pixel 9", None).unwrap();
+        for i in 0..3 {
+            db.insert_bug_report("alice", "dev-1", &format!("r{i}"), None, None)
+                .unwrap();
+        }
+        let token = state.auth.create_jwt("alice", "dev-1").unwrap();
+
+        // limit=1 → only the newest row.
+        let resp = list_bug_reports_handler(
+            State(state.clone()),
+            bearer_headers(&token),
+            Query(BugReportListQuery { limit: Some(1) }),
+        )
+        .await;
+        let body = response_json(resp).await;
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body[0]["text"], "r2");
+
+        // An over-cap limit is accepted (clamped), returning all available rows.
+        let resp = list_bug_reports_handler(
+            State(state.clone()),
+            bearer_headers(&token),
+            Query(BugReportListQuery { limit: Some(100_000) }),
+        )
+        .await;
+        let body = response_json(resp).await;
+        assert_eq!(body.as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_screenshot_served_and_missing_cases() {
+        let state = test_state();
+        let db = state.auth.db();
+        db.create_account("alice", "hash", None, None).unwrap();
+        db.add_device("dev-1", "alice", "Pixel 9", None).unwrap();
+        let token = state.auth.create_jwt("alice", "dev-1").unwrap();
+
+        let png = b"\x89PNG\r\n\x1a\nDATA";
+        let shot = write_screenshot(&state, png);
+        let with_shot = db
+            .insert_bug_report("alice", "dev-1", "has shot", Some(&shot), None)
+            .unwrap();
+        let no_shot = db
+            .insert_bug_report("alice", "dev-1", "no shot", None, None)
+            .unwrap();
+        let gone_path = state.data_dir.join("bug-reports").join("gone.png");
+        let missing_file = db
+            .insert_bug_report(
+                "alice",
+                "dev-1",
+                "file gone",
+                Some(&gone_path.to_string_lossy()),
+                None,
+            )
+            .unwrap();
+
+        // 200 with PNG bytes + content-type.
+        let resp = bug_report_screenshot_handler(
+            State(state.clone()),
+            bearer_headers(&token),
+            Path(with_shot),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], png);
+
+        // Row exists but has no screenshot → 404.
+        let resp = bug_report_screenshot_handler(
+            State(state.clone()),
+            bearer_headers(&token),
+            Path(no_shot),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Row records a path but the file is gone → 404.
+        let resp = bug_report_screenshot_handler(
+            State(state.clone()),
+            bearer_headers(&token),
+            Path(missing_file),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // No such row → 404.
+        let resp = bug_report_screenshot_handler(
+            State(state.clone()),
+            bearer_headers(&token),
+            Path(999_999),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Another account's report id is invisible → 404.
+        db.create_account("bob", "hash", None, None).unwrap();
+        db.add_device("dev-b", "bob", "iPhone", None).unwrap();
+        let bob_shot = write_screenshot(&state, b"\x89PNGbob");
+        let bob_id = db
+            .insert_bug_report("bob", "dev-b", "bob", Some(&bob_shot), None)
+            .unwrap();
+        let resp = bug_report_screenshot_handler(
+            State(state.clone()),
+            bearer_headers(&token),
+            Path(bob_id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_file(&shot);
+        let _ = std::fs::remove_file(&bob_shot);
     }
 }

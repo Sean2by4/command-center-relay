@@ -33,6 +33,21 @@ pub struct Device {
     pub last_ip: Option<String>,
 }
 
+/// A persisted bug report as read by the authenticated HTTP API. `username` is
+/// omitted deliberately (single-tenant): rows are filtered by the authenticated
+/// user, never echoed back. `screenshot_path` is server-internal — handlers
+/// expose only `has_screenshot` and stream the file from this stored path.
+#[derive(Debug, Clone)]
+pub struct BugReport {
+    pub id: i64,
+    pub device_id: String,
+    pub device_name: Option<String>,
+    pub text: String,
+    pub screenshot_path: Option<String>,
+    pub app_version: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -331,6 +346,54 @@ impl Database {
             params![username, device_id, device_name, text, screenshot_path, app_version],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// List bug reports for an account, newest first, capped at `limit` rows.
+    pub fn list_bug_reports(&self, username: &str, limit: usize) -> Result<Vec<BugReport>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, device_id, device_name, text, screenshot_path, app_version, created_at
+             FROM bug_reports WHERE username = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let reports = stmt
+            .query_map(params![username, limit as i64], |row| {
+                Ok(BugReport {
+                    id: row.get(0)?,
+                    device_id: row.get(1)?,
+                    device_name: row.get(2)?,
+                    text: row.get(3)?,
+                    screenshot_path: row.get(4)?,
+                    app_version: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(reports)
+    }
+
+    /// Fetch a single bug report by id, scoped to the owning account. Returns
+    /// None when no such row exists for that user.
+    pub fn get_bug_report(&self, username: &str, id: i64) -> Result<Option<BugReport>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let report = conn
+            .query_row(
+                "SELECT id, device_id, device_name, text, screenshot_path, app_version, created_at
+                 FROM bug_reports WHERE id = ?1 AND username = ?2",
+                params![id, username],
+                |row| {
+                    Ok(BugReport {
+                        id: row.get(0)?,
+                        device_id: row.get(1)?,
+                        device_name: row.get(2)?,
+                        text: row.get(3)?,
+                        screenshot_path: row.get(4)?,
+                        app_version: row.get(5)?,
+                        created_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(report)
     }
 
     /// Read all persisted bug reports (test-only; no prod read API yet).
