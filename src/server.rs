@@ -361,61 +361,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, ip: String) {
             }
             msg = ws_receiver.next() => {
                 match msg {
-                    Some(Ok(Message::Text(text))) => {
+                    Some(Ok(m)) => {
+                        // Any inbound frame counts as liveness.
                         ping_misses = 0;
-                        let text_str: &str = &text;
-
-                        // Enforce text message size limit
-                        if text_str.len() > MAX_TEXT_MESSAGE_SIZE {
-                            tracing::warn!(
-                                ip = %ip,
-                                size = text_str.len(),
-                                max = MAX_TEXT_MESSAGE_SIZE,
-                                "dropping oversized text message"
-                            );
-                            continue;
+                        if matches!(m, Message::Close(_)) {
+                            break;
                         }
-
-                        let ctrl: Result<ControlMessage, _> = serde_json::from_str(text_str);
-                        match ctrl {
-                            Ok(ctrl_msg) => {
-                                handle_control_message(
-                                    &ctrl_msg,
-                                    &mut role,
-                                    &state,
-                                    &outbound_tx,
-                                    &ip,
-                                ).await;
-                            }
-                            Err(e) => {
-                                tracing::warn!(ip = %ip, error = %e, "invalid JSON message");
-                            }
-                        }
+                        process_ws_message(m, &mut role, &state, &outbound_tx, &ip).await;
                     }
-                    Some(Ok(Message::Binary(data))) => {
-                        ping_misses = 0;
-
-                        // Enforce binary message size limit
-                        if data.len() > MAX_BINARY_MESSAGE_SIZE {
-                            tracing::warn!(
-                                ip = %ip,
-                                size = data.len(),
-                                max = MAX_BINARY_MESSAGE_SIZE,
-                                "dropping oversized binary message"
-                            );
-                            continue;
-                        }
-
-                        handle_binary_message(&data, &role, &state, &outbound_tx).await;
-                    }
-                    Some(Ok(Message::Ping(_))) => {
-                        ping_misses = 0;
-                        // axum auto-responds with pong
-                    }
-                    Some(Ok(Message::Pong(_))) => {
-                        ping_misses = 0;
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
+                    None => {
                         break;
                     }
                     Some(Err(e)) => {
@@ -465,6 +419,56 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, ip: String) {
 
     let _ = outbound_tx.send(WsMessage::Close);
     writer.abort();
+}
+
+/// Process one inbound WebSocket frame: enforce the per-frame size gates, then
+/// parse+dispatch. Extracted from the receive loop so tests can drive the REAL
+/// gates — critically, an oversized text frame is dropped HERE, before JSON
+/// parsing, which is why large payloads (bug-report screenshots) must travel as
+/// binary chunks rather than inline JSON.
+async fn process_ws_message(
+    msg: Message,
+    role: &mut ConnectionRole,
+    state: &Arc<AppState>,
+    outbound_tx: &ConnTx,
+    ip: &str,
+) {
+    match msg {
+        Message::Text(text) => {
+            let text_str: &str = &text;
+            if text_str.len() > MAX_TEXT_MESSAGE_SIZE {
+                tracing::warn!(
+                    ip = %ip,
+                    size = text_str.len(),
+                    max = MAX_TEXT_MESSAGE_SIZE,
+                    "dropping oversized text message"
+                );
+                return;
+            }
+            match serde_json::from_str::<ControlMessage>(text_str) {
+                Ok(ctrl_msg) => {
+                    handle_control_message(&ctrl_msg, role, state, outbound_tx, ip).await;
+                }
+                Err(e) => {
+                    tracing::warn!(ip = %ip, error = %e, "invalid JSON message");
+                }
+            }
+        }
+        Message::Binary(data) => {
+            if data.len() > MAX_BINARY_MESSAGE_SIZE {
+                tracing::warn!(
+                    ip = %ip,
+                    size = data.len(),
+                    max = MAX_BINARY_MESSAGE_SIZE,
+                    "dropping oversized binary message"
+                );
+                return;
+            }
+            handle_binary_message(&data, role, state, outbound_tx).await;
+        }
+        // Ping/Pong/Close are handled by the receive loop; nothing to do here.
+        _ => {}
+    }
 }
 
 async fn handle_control_message(
@@ -623,6 +627,32 @@ async fn handle_control_message(
                     }
                 }
             }
+            // The desktop publishes its OWN bug reports over this same governed
+            // upload path (screenshot in binary chunks, not inline JSON — which
+            // the 16KB text gate would drop). ONLY `bug_report` is accepted from
+            // a desktop; this does not open a general desktop-upload capability.
+            // Nothing is forwarded — the desktop is the endpoint.
+            if let ConnectionRole::Desktop { username } = role {
+                if kind != "bug_report" {
+                    tracing::warn!("ignoring non-bug_report file_upload_begin from desktop");
+                    return;
+                }
+                if *size > MAX_BUG_REPORT_UPLOAD_SIZE {
+                    tracing::warn!(size = *size, "ignoring oversized desktop bug_report upload");
+                    return;
+                }
+                match state.broker.begin_upload(username, upload_id, *size, outbound_tx).await {
+                    Ok(()) => {
+                        state
+                            .broker
+                            .mark_bug_report_upload(username, upload_id, outbound_tx)
+                            .await;
+                    }
+                    Err(reason) => {
+                        tracing::warn!(reason = %reason, "desktop bug_report upload rejected");
+                    }
+                }
+            }
         }
 
         // Client signals the upload is complete: mark it finished in governance
@@ -641,6 +671,7 @@ async fn handle_control_message(
                         state,
                         username,
                         device_id,
+                        None,
                         text.as_deref().unwrap_or(""),
                         &screenshot,
                     );
@@ -666,6 +697,28 @@ async fn handle_control_message(
                     .broker
                     .send_to_desktop(username, WsMessage::Text(json))
                     .await;
+            }
+            // Finalize a desktop-originated bug_report: persist the buffered
+            // screenshot + text, then clear governance. Fire-and-forget — no
+            // FileUploadResult is routed back (the desktop doesn't await one),
+            // and nothing is forwarded. A non-bug_report upload never opened a
+            // governance entry, so `take` yields None and nothing persists.
+            if let ConnectionRole::Desktop { username } = role {
+                if let Some(screenshot) = state
+                    .broker
+                    .take_bug_report_buffer(username, upload_id, outbound_tx)
+                    .await
+                {
+                    persist_bug_report(
+                        state,
+                        username,
+                        "desktop",
+                        Some("Desktop"),
+                        text.as_deref().unwrap_or(""),
+                        &screenshot,
+                    );
+                }
+                let _ = state.broker.resolve_upload(username, upload_id).await;
             }
         }
 
@@ -1347,7 +1400,21 @@ async fn handle_binary_message(
             }
             ConnectionRole::Desktop { username } => {
                 if frame_type == protocol::PTY_FILE_CHUNK {
-                    tracing::debug!("desktop sent a file chunk; ignoring");
+                    // Chunks of a desktop-originated bug_report upload: buffered
+                    // within budget for persistence, never forwarded (the
+                    // desktop is the endpoint). Chunks with no governance entry
+                    // (e.g. a rejected non-bug_report upload) simply Drop.
+                    use crate::broker::ChunkDecision;
+                    match state
+                        .broker
+                        .record_upload_chunk(username, &upload_id, outbound_tx, payload)
+                        .await
+                    {
+                        ChunkDecision::Overrun => {
+                            tracing::warn!("desktop bug_report upload overran budget; severed");
+                        }
+                        ChunkDecision::Forward | ChunkDecision::Drop => {}
+                    }
                 } else if frame_type == protocol::PTY_OUTPUT {
                     state
                         .broker
@@ -1380,12 +1447,15 @@ async fn handle_binary_message(
 
 /// Persist a bug report at the relay: write the screenshot (if any) under
 /// `<data_dir>/bug-reports/` and insert a DB row attributed to the submitting
-/// connection. All errors are logged and swallowed — persistence must never
-/// break the upload pass-through.
+/// connection. When `device_name` is `Some`, it is stored verbatim (desktop
+/// publish path, which has no devices row); when `None`, the name is resolved
+/// from the devices table (client upload path). All errors are logged and
+/// swallowed — persistence must never break the upload pass-through.
 fn persist_bug_report(
     state: &Arc<AppState>,
     username: &str,
     device_id: &str,
+    device_name: Option<&str>,
     text: &str,
     screenshot: &[u8],
 ) {
@@ -1411,14 +1481,28 @@ fn persist_bug_report(
         }
     };
 
-    // app_version is not carried in the file-upload protocol today; left NULL.
-    if let Err(e) = state.auth.db().insert_bug_report(
-        username,
-        device_id,
-        text,
-        screenshot_path.as_deref(),
-        None,
-    ) {
+    // app_version is not carried on the file-upload protocol (the desktop
+    // publish path reuses the same FileUploadEnd, which has no such field), so
+    // it is stored NULL for both paths. device_name None → resolve from the
+    // devices table (client path); Some → store verbatim (desktop path).
+    let result = match device_name {
+        Some(name) => state.auth.db().insert_bug_report_with_device_name(
+            username,
+            device_id,
+            Some(name),
+            text,
+            screenshot_path.as_deref(),
+            None,
+        ),
+        None => state.auth.db().insert_bug_report(
+            username,
+            device_id,
+            text,
+            screenshot_path.as_deref(),
+            None,
+        ),
+    };
+    if let Err(e) = result {
         tracing::error!(error = %e, "failed to persist bug report");
     }
 }
@@ -1851,6 +1935,168 @@ mod tests {
         if let Some(p) = &rows[0].4 {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    // --- Bug report publish from the desktop (BR-P2) ---
+    //
+    // The desktop publishes its OWN reports via the SAME governed upload path
+    // clients use: a bug_report file_upload_begin, the screenshot in binary
+    // PTY_FILE_CHUNK frames, then file_upload_end. Screenshots therefore never
+    // ride an inline JSON text frame (which the 16KB gate would drop).
+
+    fn desktop_role() -> ConnectionRole {
+        ConnectionRole::Desktop { username: "alice".into() }
+    }
+
+    /// Build the begin/chunk(s)/end frames a desktop sends for one bug report,
+    /// as raw WebSocket `Message`s so a test can push them through the REAL
+    /// receive-loop gates via `process_ws_message`.
+    fn desktop_bug_report_frames(upload_id: &str, text: &str, screenshot: &[u8]) -> Vec<Message> {
+        let mut msgs = Vec::new();
+        let begin = ControlMessage::FileUploadBegin {
+            upload_id: upload_id.into(),
+            kind: "bug_report".into(),
+            name: "screenshot.png".into(),
+            size: screenshot.len() as u64,
+            mime: "image/png".into(),
+            session_id: None,
+        };
+        msgs.push(Message::Text(serde_json::to_string(&begin).unwrap().into()));
+        for chunk in screenshot.chunks(48 * 1024) {
+            let frame = protocol::build_binary_frame(protocol::PTY_FILE_CHUNK, upload_id, chunk);
+            msgs.push(Message::Binary(frame.into()));
+        }
+        let end = ControlMessage::FileUploadEnd {
+            upload_id: upload_id.into(),
+            text: Some(text.into()),
+        };
+        msgs.push(Message::Text(serde_json::to_string(&end).unwrap().into()));
+        msgs
+    }
+
+    /// End-to-end through the REAL receive-loop gates: a bug-report screenshot
+    /// far larger than the 16KB text cap persists (row + file) attributed to the
+    /// desktop. Inline JSON would be dropped at the text gate before reaching a
+    /// handler; travelling as binary chunks it survives.
+    #[tokio::test]
+    async fn test_desktop_bug_report_large_screenshot_survives_text_gate() {
+        let state = test_state();
+        state.auth.db().create_account("alice", "hash", None, None).unwrap();
+        let (ctx, _crx) = test_conn();
+        let mut role = desktop_role();
+
+        // 200KB screenshot — over 12x the text gate; a base64-in-JSON frame
+        // would be dropped at MAX_TEXT_MESSAGE_SIZE.
+        let png: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        assert!(png.len() > MAX_TEXT_MESSAGE_SIZE, "screenshot must exceed the text gate");
+
+        let upload_id = "d".repeat(36);
+        for msg in desktop_bug_report_frames(&upload_id, "huge screenshot", &png) {
+            if let Message::Binary(b) = &msg {
+                assert!(b.len() <= MAX_BINARY_MESSAGE_SIZE, "chunk must fit the binary gate");
+            }
+            process_ws_message(msg, &mut role, &state, &ctx, "1.2.3.4").await;
+        }
+
+        let rows = state.auth.db().list_bug_reports_for_test();
+        assert_eq!(rows.len(), 1);
+        let (username, device_id, device_name, text, screenshot_path, version) = &rows[0];
+        assert_eq!(username, "alice");
+        assert_eq!(device_id, "desktop");
+        assert_eq!(device_name.as_deref(), Some("Desktop"));
+        assert_eq!(text, "huge screenshot");
+        assert!(version.is_none());
+        let path = screenshot_path.as_ref().expect("screenshot persisted");
+        assert_eq!(std::fs::read(path).unwrap(), png);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A screenshot-less desktop report persists text with a NULL screenshot.
+    #[tokio::test]
+    async fn test_desktop_bug_report_text_only_persists() {
+        let state = test_state();
+        state.auth.db().create_account("alice", "hash", None, None).unwrap();
+        let (ctx, _crx) = test_conn();
+        let mut role = desktop_role();
+
+        let upload_id = "e".repeat(36);
+        for msg in desktop_bug_report_frames(&upload_id, "text only", &[]) {
+            process_ws_message(msg, &mut role, &state, &ctx, "1.2.3.4").await;
+        }
+
+        let rows = state.auth.db().list_bug_reports_for_test();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "desktop");
+        assert_eq!(rows[0].2.as_deref(), Some("Desktop"));
+        assert_eq!(rows[0].3, "text only");
+        assert!(rows[0].4.is_none(), "no screenshot path for a text-only report");
+    }
+
+    /// A non-bug_report upload from a desktop is refused — it must NOT open a
+    /// general desktop-upload capability. Nothing persists.
+    #[tokio::test]
+    async fn test_desktop_non_bug_report_upload_ignored() {
+        let state = test_state();
+        state.auth.db().create_account("alice", "hash", None, None).unwrap();
+        let (ctx, _crx) = test_conn();
+        let mut role = desktop_role();
+
+        let upload_id = "f".repeat(36);
+        let begin = ControlMessage::FileUploadBegin {
+            upload_id: upload_id.clone(),
+            kind: "attachment".into(),
+            name: "a.png".into(),
+            size: 4,
+            mime: "image/png".into(),
+            session_id: None,
+        };
+        process_ws_message(
+            Message::Text(serde_json::to_string(&begin).unwrap().into()),
+            &mut role, &state, &ctx, "1.2.3.4",
+        ).await;
+        let frame = protocol::build_binary_frame(protocol::PTY_FILE_CHUNK, &upload_id, b"\x89PNG");
+        process_ws_message(Message::Binary(frame.into()), &mut role, &state, &ctx, "1.2.3.4").await;
+        let end = ControlMessage::FileUploadEnd { upload_id, text: Some("x".into()) };
+        process_ws_message(
+            Message::Text(serde_json::to_string(&end).unwrap().into()),
+            &mut role, &state, &ctx, "1.2.3.4",
+        ).await;
+
+        assert!(state.auth.db().list_bug_reports_for_test().is_empty());
+    }
+
+    /// A desktop bug_report whose declared size exceeds the 10MB cap is rejected
+    /// at begin — no governance entry, so nothing persists.
+    #[tokio::test]
+    async fn test_desktop_bug_report_oversize_begin_rejected() {
+        let state = test_state();
+        state.auth.db().create_account("alice", "hash", None, None).unwrap();
+        let (ctx, _crx) = test_conn();
+        let mut role = desktop_role();
+
+        let upload_id = "g".repeat(36);
+        let begin = ControlMessage::FileUploadBegin {
+            upload_id: upload_id.clone(),
+            kind: "bug_report".into(),
+            name: "screenshot.png".into(),
+            size: MAX_BUG_REPORT_UPLOAD_SIZE + 1,
+            mime: "image/png".into(),
+            session_id: None,
+        };
+        process_ws_message(
+            Message::Text(serde_json::to_string(&begin).unwrap().into()),
+            &mut role, &state, &ctx, "1.2.3.4",
+        ).await;
+        // A chunk arrives anyway (attacker ignores the reject) — it must Drop.
+        let frame = protocol::build_binary_frame(protocol::PTY_FILE_CHUNK, &upload_id, b"\x89PNG");
+        process_ws_message(Message::Binary(frame.into()), &mut role, &state, &ctx, "1.2.3.4").await;
+        let end = ControlMessage::FileUploadEnd { upload_id, text: Some("huge".into()) };
+        process_ws_message(
+            Message::Text(serde_json::to_string(&end).unwrap().into()),
+            &mut role, &state, &ctx, "1.2.3.4",
+        ).await;
+
+        assert!(state.auth.db().list_bug_reports_for_test().is_empty());
     }
 
     // --- Supervisor routing invariants ---

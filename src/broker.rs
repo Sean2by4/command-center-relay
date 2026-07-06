@@ -354,6 +354,11 @@ impl Broker {
     pub async fn unregister_desktop(&self, username: &str, conn: &ConnTx) {
         let mut accounts = self.accounts.write().await;
         if let Some(state) = accounts.get_mut(username) {
+            // Free uploads owned by the dying connection (desktop bug-report
+            // publishes) before the stale-desktop early return, mirroring the
+            // client cleanup in unregister_client — a crashed publish must not
+            // hold its buffer and upload slot until the idle sweep.
+            state.uploads.retain(|_, e| !e.owner.same_conn(conn));
             match &state.desktop_tx {
                 Some(current) if !current.same_conn(conn) => {
                     tracing::info!(

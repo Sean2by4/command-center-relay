@@ -341,6 +341,50 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?;
+        Self::insert_bug_report_row(
+            &conn,
+            username,
+            device_id,
+            device_name.as_deref(),
+            text,
+            screenshot_path,
+            app_version,
+        )
+    }
+
+    /// Persist a bug report with an explicit device name, bypassing the
+    /// devices-table lookup. Used by the desktop publish path, which has no
+    /// devices row (device_id "desktop") yet wants a stable display name.
+    pub fn insert_bug_report_with_device_name(
+        &self,
+        username: &str,
+        device_id: &str,
+        device_name: Option<&str>,
+        text: &str,
+        screenshot_path: Option<&str>,
+        app_version: Option<&str>,
+    ) -> Result<i64, DbError> {
+        let conn = self.conn.lock().unwrap();
+        Self::insert_bug_report_row(
+            &conn,
+            username,
+            device_id,
+            device_name,
+            text,
+            screenshot_path,
+            app_version,
+        )
+    }
+
+    fn insert_bug_report_row(
+        conn: &rusqlite::Connection,
+        username: &str,
+        device_id: &str,
+        device_name: Option<&str>,
+        text: &str,
+        screenshot_path: Option<&str>,
+        app_version: Option<&str>,
+    ) -> Result<i64, DbError> {
         conn.execute(
             "INSERT INTO bug_reports (username, device_id, device_name, text, screenshot_path, app_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![username, device_id, device_name, text, screenshot_path, app_version],
