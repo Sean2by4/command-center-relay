@@ -94,7 +94,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let push = push::PushManager::init(database.clone())?;
             let auth = AuthManager::new(database)?;
             let broker = Broker::new();
-            let state = Arc::new(AppState::new(broker, auth, push));
+            // Bug-report screenshots live alongside the DB, under its parent dir.
+            let data_dir = db
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let state = Arc::new(AppState::new(broker, auth, push, data_dir));
 
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 

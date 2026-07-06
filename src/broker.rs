@@ -145,6 +145,9 @@ struct UploadEntry {
     last_activity: Instant,
     /// Set by `file_upload_end`; further chunks are ignored.
     finished: bool,
+    /// For `bug_report` uploads only: forwarded chunk payloads accumulated for
+    /// relay-side persistence. `None` for every other kind (pass-through only).
+    buffer: Option<Vec<u8>>,
 }
 
 /// One pending supervisor query, keyed by the client-minted query id. The
@@ -577,9 +580,44 @@ impl Broker {
                 bytes_forwarded: 0,
                 last_activity: Instant::now(),
                 finished: false,
+                buffer: None,
             },
         );
         Ok(())
+    }
+
+    /// Mark an in-flight upload as a `bug_report` so its forwarded chunks are
+    /// buffered at the relay for persistence. Only the owning connection can
+    /// mark its own upload; a no-op if the upload/owner is gone.
+    pub async fn mark_bug_report_upload(&self, username: &str, upload_id: &str, conn: &ConnTx) {
+        let mut accounts = self.accounts.write().await;
+        let Some(state) = accounts.get_mut(username) else {
+            return;
+        };
+        if let Some(entry) = state.uploads.get_mut(upload_id) {
+            if entry.owner.same_conn(conn) {
+                entry.buffer = Some(Vec::new());
+            }
+        }
+    }
+
+    /// Take a finished bug report's buffered bytes for persistence. Returns
+    /// `Some(bytes)` only when the upload is a `bug_report` owned by `conn`
+    /// (bytes may be empty = no screenshot); `None` for any other upload. The
+    /// governance entry is left in place for the normal result-routing path.
+    pub async fn take_bug_report_buffer(
+        &self,
+        username: &str,
+        upload_id: &str,
+        conn: &ConnTx,
+    ) -> Option<Vec<u8>> {
+        let mut accounts = self.accounts.write().await;
+        let state = accounts.get_mut(username)?;
+        let entry = state.uploads.get_mut(upload_id)?;
+        if !entry.owner.same_conn(conn) {
+            return None;
+        }
+        entry.buffer.take()
     }
 
     /// Govern one `PTY_FILE_CHUNK`. See `ChunkDecision`.
@@ -588,7 +626,7 @@ impl Broker {
         username: &str,
         upload_id: &str,
         conn: &ConnTx,
-        payload_len: usize,
+        payload: &[u8],
     ) -> ChunkDecision {
         let mut accounts = self.accounts.write().await;
         let Some(state) = accounts.get_mut(username) else {
@@ -601,12 +639,17 @@ impl Broker {
         if entry.finished || !entry.owner.same_conn(conn) {
             return ChunkDecision::Drop;
         }
-        entry.bytes_forwarded += payload_len as u64;
+        entry.bytes_forwarded += payload.len() as u64;
         entry.last_activity = Instant::now();
         let budget = entry.declared_size.min(MAX_UPLOAD_SIZE);
         if entry.bytes_forwarded > budget {
             state.uploads.remove(upload_id);
             return ChunkDecision::Overrun;
+        }
+        // Buffer bug-report payloads for persistence (within budget by the
+        // check above); no-op for every other kind.
+        if let Some(buf) = entry.buffer.as_mut() {
+            buf.extend_from_slice(payload);
         }
         ChunkDecision::Forward
     }
@@ -1240,7 +1283,7 @@ mod tests {
         let broker = Broker::new();
         let (tx, _rx) = test_conn();
         assert_eq!(
-            broker.record_upload_chunk("alice", "ghost", &tx, 512).await,
+            broker.record_upload_chunk("alice", "ghost", &tx, &[0u8; 512]).await,
             ChunkDecision::Drop
         );
     }
@@ -1253,12 +1296,12 @@ mod tests {
         broker.begin_upload("alice", "u1", 4096, &owner).await.unwrap();
         // A different connection cannot push chunks into someone else's upload.
         assert_eq!(
-            broker.record_upload_chunk("alice", "u1", &other, 512).await,
+            broker.record_upload_chunk("alice", "u1", &other, &[0u8; 512]).await,
             ChunkDecision::Drop
         );
         // The owner's chunk is forwarded.
         assert_eq!(
-            broker.record_upload_chunk("alice", "u1", &owner, 512).await,
+            broker.record_upload_chunk("alice", "u1", &owner, &[0u8; 512]).await,
             ChunkDecision::Forward
         );
     }
@@ -1270,17 +1313,17 @@ mod tests {
         broker.begin_upload("alice", "u1", 1000, &tx).await.unwrap();
         // Within budget.
         assert_eq!(
-            broker.record_upload_chunk("alice", "u1", &tx, 800).await,
+            broker.record_upload_chunk("alice", "u1", &tx, &[0u8; 800]).await,
             ChunkDecision::Forward
         );
         // Exceeds declared size → overrun; upload state is dropped.
         assert_eq!(
-            broker.record_upload_chunk("alice", "u1", &tx, 300).await,
+            broker.record_upload_chunk("alice", "u1", &tx, &[0u8; 300]).await,
             ChunkDecision::Overrun
         );
         // Now there's no active begin — subsequent chunks are dropped.
         assert_eq!(
-            broker.record_upload_chunk("alice", "u1", &tx, 10).await,
+            broker.record_upload_chunk("alice", "u1", &tx, &[0u8; 10]).await,
             ChunkDecision::Drop
         );
     }
@@ -1292,9 +1335,44 @@ mod tests {
         broker.begin_upload("alice", "u1", 4096, &tx).await.unwrap();
         broker.finish_upload("alice", "u1", &tx).await;
         assert_eq!(
-            broker.record_upload_chunk("alice", "u1", &tx, 512).await,
+            broker.record_upload_chunk("alice", "u1", &tx, &[0u8; 512]).await,
             ChunkDecision::Drop
         );
+    }
+
+    #[tokio::test]
+    async fn test_bug_report_buffers_chunks_and_takes_them() {
+        let broker = Broker::new();
+        let (tx, _rx) = test_conn();
+        broker.begin_upload("alice", "u1", 4096, &tx).await.unwrap();
+        broker.mark_bug_report_upload("alice", "u1", &tx).await;
+        assert_eq!(
+            broker.record_upload_chunk("alice", "u1", &tx, b"\x89PNG").await,
+            ChunkDecision::Forward
+        );
+        assert_eq!(
+            broker.record_upload_chunk("alice", "u1", &tx, b"more").await,
+            ChunkDecision::Forward
+        );
+        // Buffer holds the concatenated payloads.
+        let bytes = broker.take_bug_report_buffer("alice", "u1", &tx).await.unwrap();
+        assert_eq!(bytes, b"\x89PNGmore");
+        // A second take yields nothing (buffer already consumed).
+        assert!(broker.take_bug_report_buffer("alice", "u1", &tx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unmarked_upload_is_not_buffered() {
+        let broker = Broker::new();
+        let (tx, _rx) = test_conn();
+        broker.begin_upload("alice", "u1", 4096, &tx).await.unwrap();
+        // Never marked as a bug report.
+        assert_eq!(
+            broker.record_upload_chunk("alice", "u1", &tx, b"data").await,
+            ChunkDecision::Forward
+        );
+        // Not a bug report → take returns None.
+        assert!(broker.take_bug_report_buffer("alice", "u1", &tx).await.is_none());
     }
 
     #[tokio::test]

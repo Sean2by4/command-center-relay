@@ -38,6 +38,18 @@ pub struct Database {
     conn: Arc<Mutex<Connection>>,
 }
 
+/// A persisted bug report row as read by tests:
+/// (username, device_id, device_name, text, screenshot_path, app_version).
+#[cfg(test)]
+type BugReportRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
@@ -63,6 +75,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(include_str!("../migrations/001_initial.sql"))?;
         conn.execute_batch(include_str!("../migrations/002_push_subscriptions.sql"))?;
+        conn.execute_batch(include_str!("../migrations/003_bug_reports.sql"))?;
         Ok(())
     }
 
@@ -292,6 +305,58 @@ impl Database {
         )?;
         Ok(())
     }
+
+    // --- Bug reports ---
+
+    /// Persist a bug report. The device name is resolved from the devices table
+    /// at insert time (NULL when the device row is gone). Returns the row id.
+    pub fn insert_bug_report(
+        &self,
+        username: &str,
+        device_id: &str,
+        text: &str,
+        screenshot_path: Option<&str>,
+        app_version: Option<&str>,
+    ) -> Result<i64, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let device_name: Option<String> = conn
+            .query_row(
+                "SELECT name FROM devices WHERE id = ?1",
+                params![device_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        conn.execute(
+            "INSERT INTO bug_reports (username, device_id, device_name, text, screenshot_path, app_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![username, device_id, device_name, text, screenshot_path, app_version],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Read all persisted bug reports (test-only; no prod read API yet).
+    /// Row shape: (username, device_id, device_name, text, screenshot_path, app_version).
+    #[cfg(test)]
+    pub fn list_bug_reports_for_test(&self) -> Vec<BugReportRow> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT username, device_id, device_name, text, screenshot_path, app_version FROM bug_reports ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +443,35 @@ mod tests {
         db.log_event("auth_failure", Some("bob"), None, Some("5.6.7.8"), Some("bad password"))
             .unwrap();
         // Just verify no errors — we don't expose a read API for audit_log in prod
+    }
+
+    #[test]
+    fn test_insert_bug_report_resolves_device_name() {
+        let db = test_db();
+        db.create_account("alice", "hash", None, None).unwrap();
+        db.add_device("dev-1", "alice", "Pixel 9", Some("1.2.3.4")).unwrap();
+
+        let id = db
+            .insert_bug_report("alice", "dev-1", "it broke", Some("bug-reports/x.png"), None)
+            .unwrap();
+        assert!(id > 0);
+
+        let rows = db.list_bug_reports_for_test();
+        assert_eq!(rows.len(), 1);
+        let (username, device_id, device_name, text, screenshot, version) = &rows[0];
+        assert_eq!(username, "alice");
+        assert_eq!(device_id, "dev-1");
+        assert_eq!(device_name.as_deref(), Some("Pixel 9"));
+        assert_eq!(text, "it broke");
+        assert_eq!(screenshot.as_deref(), Some("bug-reports/x.png"));
+        assert!(version.is_none());
+
+        // Unknown device → device_name is NULL, report still persists.
+        db.insert_bug_report("alice", "ghost", "no device", None, None)
+            .unwrap();
+        let rows = db.list_bug_reports_for_test();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].2.is_none());
     }
 
     #[test]

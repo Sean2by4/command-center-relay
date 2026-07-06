@@ -29,21 +29,28 @@ const MAX_BINARY_MESSAGE_SIZE: usize = 64 * 1024;
 const WS_RATE_LIMIT_PER_MINUTE: usize = 10;
 /// Shutdown grace period for open connections.
 const SHUTDOWN_GRACE_SECS: u64 = 5;
+/// Hard cap on a buffered bug-report upload. Reports are small (one screenshot
+/// + text); anything larger is rejected before the relay buffers it.
+const MAX_BUG_REPORT_UPLOAD_SIZE: u64 = 10 * 1024 * 1024;
 
 pub struct AppState {
     pub broker: Broker,
     pub auth: AuthManager,
     pub push: PushManager,
+    /// Base data directory (parent of the SQLite DB). Bug-report screenshots
+    /// are written under `<data_dir>/bug-reports/`.
+    pub data_dir: PathBuf,
     /// Per-IP WebSocket connection rate limiter: IP -> list of connection timestamps.
     ws_rate_limits: Mutex<HashMap<String, Vec<std::time::Instant>>>,
 }
 
 impl AppState {
-    pub fn new(broker: Broker, auth: AuthManager, push: PushManager) -> Self {
+    pub fn new(broker: Broker, auth: AuthManager, push: PushManager, data_dir: PathBuf) -> Self {
         Self {
             broker,
             auth,
             push,
+            data_dir,
             ws_rate_limits: Mutex::new(HashMap::new()),
         }
     }
@@ -447,14 +454,35 @@ async fn handle_control_message(
         // Client announces a file upload. The relay governs it (size / slot /
         // duplicate limits) before forwarding; a rejection is answered with a
         // relay-originated failure result to the sender only.
-        ControlMessage::FileUploadBegin { upload_id, size, .. } => {
+        ControlMessage::FileUploadBegin { upload_id, kind, size, .. } => {
             if let ConnectionRole::Client { username, .. } = role {
+                // Bug reports are buffered and persisted at the relay, so they
+                // carry a stricter size cap than the broker's generic limit.
+                if kind == "bug_report" && *size > MAX_BUG_REPORT_UPLOAD_SIZE {
+                    let fail = ControlMessage::FileUploadResult {
+                        upload_id: upload_id.clone(),
+                        ok: false,
+                        path: None,
+                        error: Some("file_too_large".into()),
+                    };
+                    let _ = outbound_tx
+                        .send(WsMessage::Text(serde_json::to_string(&fail).unwrap()));
+                    return;
+                }
                 match state
                     .broker
                     .begin_upload(username, upload_id, *size, outbound_tx)
                     .await
                 {
                     Ok(()) => {
+                        // Mark bug reports so their chunks are buffered for
+                        // persistence; other kinds pass through untouched.
+                        if kind == "bug_report" {
+                            state
+                                .broker
+                                .mark_bug_report_upload(username, upload_id, outbound_tx)
+                                .await;
+                        }
                         let json = serde_json::to_string(msg).unwrap();
                         let _ = state
                             .broker
@@ -478,8 +506,39 @@ async fn handle_control_message(
 
         // Client signals the upload is complete: mark it finished in governance
         // state and forward to the desktop to finalize the write.
-        ControlMessage::FileUploadEnd { upload_id, .. } => {
-            if let ConnectionRole::Client { username, .. } = role {
+        ControlMessage::FileUploadEnd { upload_id, text } => {
+            if let ConnectionRole::Client { username, device_id } = role {
+                // Bug reports are persisted at the relay (DB row + screenshot)
+                // before the normal pass-through. Persistence failures are
+                // logged and never break the pass-through path.
+                if let Some(screenshot) = state
+                    .broker
+                    .take_bug_report_buffer(username, upload_id, outbound_tx)
+                    .await
+                {
+                    persist_bug_report(
+                        state,
+                        username,
+                        device_id,
+                        text.as_deref().unwrap_or(""),
+                        &screenshot,
+                    );
+                    // With no desktop to finalize and answer, the relay clears
+                    // its governance entry and synthesizes the success result
+                    // the client would otherwise wait forever for.
+                    if !state.broker.is_desktop_online(username).await {
+                        let _ = state.broker.resolve_upload(username, upload_id).await;
+                        let ok = ControlMessage::FileUploadResult {
+                            upload_id: upload_id.clone(),
+                            ok: true,
+                            path: None,
+                            error: None,
+                        };
+                        let _ = outbound_tx
+                            .send(WsMessage::Text(serde_json::to_string(&ok).unwrap()));
+                        return;
+                    }
+                }
                 state.broker.finish_upload(username, upload_id, outbound_tx).await;
                 let json = serde_json::to_string(msg).unwrap();
                 let _ = state
@@ -1141,7 +1200,7 @@ async fn handle_binary_message(
                     use crate::broker::ChunkDecision;
                     match state
                         .broker
-                        .record_upload_chunk(username, &upload_id, outbound_tx, payload.len())
+                        .record_upload_chunk(username, &upload_id, outbound_tx, payload)
                         .await
                     {
                         ChunkDecision::Forward => {
@@ -1195,6 +1254,51 @@ async fn handle_binary_message(
         Err(e) => {
             tracing::warn!(error = %e, "invalid binary frame");
         }
+    }
+}
+
+/// Persist a bug report at the relay: write the screenshot (if any) under
+/// `<data_dir>/bug-reports/` and insert a DB row attributed to the submitting
+/// connection. All errors are logged and swallowed — persistence must never
+/// break the upload pass-through.
+fn persist_bug_report(
+    state: &Arc<AppState>,
+    username: &str,
+    device_id: &str,
+    text: &str,
+    screenshot: &[u8],
+) {
+    let screenshot_path = if screenshot.is_empty() {
+        None
+    } else {
+        let dir = state.data_dir.join("bug-reports");
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => {
+                let path = dir.join(format!("{}.png", uuid::Uuid::new_v4()));
+                match std::fs::write(&path, screenshot) {
+                    Ok(()) => Some(path.to_string_lossy().into_owned()),
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to write bug report screenshot");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create bug-reports directory");
+                None
+            }
+        }
+    };
+
+    // app_version is not carried in the file-upload protocol today; left NULL.
+    if let Err(e) = state.auth.db().insert_bug_report(
+        username,
+        device_id,
+        text,
+        screenshot_path.as_deref(),
+        None,
+    ) {
+        tracing::error!(error = %e, "failed to persist bug report");
     }
 }
 
@@ -1328,7 +1432,8 @@ mod tests {
         let db = crate::db::Database::open_in_memory().unwrap();
         let push = PushManager::init(db.clone()).unwrap();
         let auth = AuthManager::new(db).unwrap();
-        Arc::new(AppState::new(Broker::new(), auth, push))
+        let data_dir = std::env::temp_dir().join(format!("cc-relay-test-{}", uuid::Uuid::new_v4()));
+        Arc::new(AppState::new(Broker::new(), auth, push, data_dir))
     }
 
     fn test_conn() -> (ConnTx, mpsc::UnboundedReceiver<WsMessage>) {
@@ -1487,6 +1592,144 @@ mod tests {
             _ => panic!("expected result on owner"),
         }
         assert!(xrx.try_recv().is_err(), "non-owner must not receive the result");
+    }
+
+    // --- Bug report persistence (BR-P1) ---
+
+    /// A bug_report upload persists a DB row + screenshot file with the correct
+    /// attribution, and still forwards to the desktop (dual-write).
+    #[tokio::test]
+    async fn test_bug_report_persists_row_and_file() {
+        let state = test_state();
+        state.auth.db().create_account("alice", "hash", None, None).unwrap();
+        state.auth.db().add_device("dev-1", "alice", "Pixel 9", Some("1.2.3.4")).unwrap();
+
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx, None).await.unwrap();
+
+        let (ctx, _crx) = test_conn();
+        let mut role = client_role();
+
+        let upload_id = "b".repeat(36);
+        let begin = ControlMessage::FileUploadBegin {
+            upload_id: upload_id.clone(),
+            kind: "bug_report".into(),
+            name: "screenshot.png".into(),
+            size: 4,
+            mime: "image/png".into(),
+            session_id: None,
+        };
+        handle_control_message(&begin, &mut role, &state, &ctx, "1.2.3.4").await;
+        assert!(matches!(drx.recv().await.unwrap(), WsMessage::Text(_)), "begin forwarded");
+
+        let frame = protocol::build_binary_frame(protocol::PTY_FILE_CHUNK, &upload_id, b"\x89PNG");
+        handle_binary_message(&frame, &role, &state, &ctx).await;
+        assert!(matches!(drx.recv().await.unwrap(), WsMessage::Binary(_)), "chunk forwarded (dual-write)");
+
+        let end = ControlMessage::FileUploadEnd {
+            upload_id: upload_id.clone(),
+            text: Some("app crashed".into()),
+        };
+        handle_control_message(&end, &mut role, &state, &ctx, "1.2.3.4").await;
+        assert!(matches!(drx.recv().await.unwrap(), WsMessage::Text(_)), "end forwarded (desktop online)");
+
+        let rows = state.auth.db().list_bug_reports_for_test();
+        assert_eq!(rows.len(), 1);
+        let (username, device_id, device_name, text, screenshot_path, version) = &rows[0];
+        assert_eq!(username, "alice");
+        assert_eq!(device_id, "dev-1");
+        assert_eq!(device_name.as_deref(), Some("Pixel 9"));
+        assert_eq!(text, "app crashed");
+        assert!(version.is_none());
+
+        let path = screenshot_path.as_ref().expect("screenshot path recorded");
+        assert_eq!(std::fs::read(path).unwrap(), b"\x89PNG");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Non-bug_report uploads are neither buffered nor persisted.
+    #[tokio::test]
+    async fn test_non_bug_report_upload_not_persisted() {
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx, None).await.unwrap();
+
+        let (ctx, _crx) = test_conn();
+        let mut role = client_role();
+
+        let upload_id = "a".repeat(36);
+        let begin = ControlMessage::FileUploadBegin {
+            upload_id: upload_id.clone(),
+            kind: "attachment".into(),
+            name: "a.png".into(),
+            size: 4,
+            mime: "image/png".into(),
+            session_id: None,
+        };
+        handle_control_message(&begin, &mut role, &state, &ctx, "1.2.3.4").await;
+        let _ = drx.recv().await;
+
+        let frame = protocol::build_binary_frame(protocol::PTY_FILE_CHUNK, &upload_id, b"\x89PNG");
+        handle_binary_message(&frame, &role, &state, &ctx).await;
+        let _ = drx.recv().await;
+
+        let end = ControlMessage::FileUploadEnd {
+            upload_id: upload_id.clone(),
+            text: Some("ignore me".into()),
+        };
+        handle_control_message(&end, &mut role, &state, &ctx, "1.2.3.4").await;
+
+        assert!(state.auth.db().list_bug_reports_for_test().is_empty());
+    }
+
+    /// A bug_report persists and the client receives a synthesized success
+    /// result even when no desktop is connected for the account.
+    #[tokio::test]
+    async fn test_bug_report_succeeds_without_desktop() {
+        let state = test_state();
+        state.auth.db().create_account("alice", "hash", None, None).unwrap();
+        state.auth.db().add_device("dev-1", "alice", "Pixel 9", None).unwrap();
+
+        // No desktop registered.
+        let (ctx, mut crx) = test_conn();
+        let mut role = client_role();
+
+        let upload_id = "c".repeat(36);
+        let begin = ControlMessage::FileUploadBegin {
+            upload_id: upload_id.clone(),
+            kind: "bug_report".into(),
+            name: "s.png".into(),
+            size: 4,
+            mime: "image/png".into(),
+            session_id: None,
+        };
+        handle_control_message(&begin, &mut role, &state, &ctx, "1.2.3.4").await;
+
+        let frame = protocol::build_binary_frame(protocol::PTY_FILE_CHUNK, &upload_id, b"\x89PNG");
+        handle_binary_message(&frame, &role, &state, &ctx).await;
+
+        let end = ControlMessage::FileUploadEnd {
+            upload_id: upload_id.clone(),
+            text: Some("offline report".into()),
+        };
+        handle_control_message(&end, &mut role, &state, &ctx, "1.2.3.4").await;
+
+        // Client gets a relay-synthesized success result.
+        match crx.recv().await.unwrap() {
+            WsMessage::Text(t) => {
+                assert!(t.contains("file_upload_result"));
+                assert!(t.contains("\"ok\":true"));
+            }
+            _ => panic!("expected synthesized success result"),
+        }
+
+        let rows = state.auth.db().list_bug_reports_for_test();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3, "offline report");
+        assert_eq!(rows[0].1, "dev-1");
+        if let Some(p) = &rows[0].4 {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     // --- Supervisor routing invariants ---
