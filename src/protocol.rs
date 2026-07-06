@@ -242,6 +242,36 @@ pub enum ControlMessage {
         error: Option<String>,
     },
 
+    // --- Supervisor (client → relay → desktop; result/error → requester only) ---
+    /// Client asks the desktop a supervisor question. Forwarded VERBATIM to the
+    /// desktop by the relay — `kind` is OPAQUE and never matched relay-side.
+    #[serde(rename = "supervisor_query")]
+    SupervisorQuery {
+        /// Client-minted, high-entropy correlation id.
+        id: String,
+        /// Query kind — opaque to the relay.
+        kind: String,
+        #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(rename = "lastFingerprint", skip_serializing_if = "Option::is_none")]
+        last_fingerprint: Option<String>,
+    },
+    /// Desktop answers a supervisor query; routed to the requesting client only.
+    #[serde(rename = "supervisor_result")]
+    SupervisorResult {
+        id: String,
+        payload: serde_json::Value,
+    },
+    /// Supervisor failure (desktop-originated OR relay-synthesized); routed to
+    /// the requesting client only. Both origins are wire-identical.
+    #[serde(rename = "supervisor_error")]
+    SupervisorError {
+        id: String,
+        message: String,
+    },
+
     // --- Health ---
     #[serde(rename = "ping")]
     Ping,
@@ -544,6 +574,92 @@ mod tests {
         };
         let json = serde_json::to_string(&offline).unwrap();
         assert!(!json.contains("capabilities"));
+    }
+
+    #[test]
+    fn test_supervisor_query_golden_fixtures() {
+        // Fixture 1: minimal query (no optional fields → omitted on the wire).
+        let fix1 = r#"{"type":"supervisor_query","id":"sq-fixture01","kind":"fleet_status"}"#;
+        let msg1 = ControlMessage::SupervisorQuery {
+            id: "sq-fixture01".into(),
+            kind: "fleet_status".into(),
+            session_id: None,
+            text: None,
+            last_fingerprint: None,
+        };
+        let got1: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg1).unwrap()).unwrap();
+        let want1: serde_json::Value = serde_json::from_str(fix1).unwrap();
+        assert_eq!(got1, want1);
+        match serde_json::from_str::<ControlMessage>(fix1).unwrap() {
+            ControlMessage::SupervisorQuery { id, kind, session_id, text, last_fingerprint } => {
+                assert_eq!(id, "sq-fixture01");
+                assert_eq!(kind, "fleet_status");
+                assert!(session_id.is_none() && text.is_none() && last_fingerprint.is_none());
+            }
+            _ => panic!("expected SupervisorQuery"),
+        }
+
+        // Fixture 2: sessionId + lastFingerprint camelCase renames present.
+        let fix2 = r#"{"type":"supervisor_query","id":"sq-fixture02","kind":"summary","sessionId":"sess-1","lastFingerprint":"fp-1"}"#;
+        let msg2 = ControlMessage::SupervisorQuery {
+            id: "sq-fixture02".into(),
+            kind: "summary".into(),
+            session_id: Some("sess-1".into()),
+            text: None,
+            last_fingerprint: Some("fp-1".into()),
+        };
+        let got2: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg2).unwrap()).unwrap();
+        let want2: serde_json::Value = serde_json::from_str(fix2).unwrap();
+        assert_eq!(got2, want2);
+        match serde_json::from_str::<ControlMessage>(fix2).unwrap() {
+            ControlMessage::SupervisorQuery { session_id, last_fingerprint, .. } => {
+                assert_eq!(session_id.unwrap(), "sess-1");
+                assert_eq!(last_fingerprint.unwrap(), "fp-1");
+            }
+            _ => panic!("expected SupervisorQuery"),
+        }
+    }
+
+    #[test]
+    fn test_supervisor_result_golden_fixture() {
+        let fix = r#"{"type":"supervisor_result","id":"sq-fixture01","payload":{"fleet":[]}}"#;
+        let msg = ControlMessage::SupervisorResult {
+            id: "sq-fixture01".into(),
+            payload: serde_json::json!({ "fleet": [] }),
+        };
+        let got: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        let want: serde_json::Value = serde_json::from_str(fix).unwrap();
+        assert_eq!(got, want);
+        match serde_json::from_str::<ControlMessage>(fix).unwrap() {
+            ControlMessage::SupervisorResult { id, payload } => {
+                assert_eq!(id, "sq-fixture01");
+                assert_eq!(payload, serde_json::json!({ "fleet": [] }));
+            }
+            _ => panic!("expected SupervisorResult"),
+        }
+    }
+
+    #[test]
+    fn test_supervisor_error_golden_fixture() {
+        let fix = r#"{"type":"supervisor_error","id":"sq-fixture01","message":"desktop offline"}"#;
+        let msg = ControlMessage::SupervisorError {
+            id: "sq-fixture01".into(),
+            message: "desktop offline".into(),
+        };
+        let got: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        let want: serde_json::Value = serde_json::from_str(fix).unwrap();
+        assert_eq!(got, want);
+        match serde_json::from_str::<ControlMessage>(fix).unwrap() {
+            ControlMessage::SupervisorError { id, message } => {
+                assert_eq!(id, "sq-fixture01");
+                assert_eq!(message, "desktop offline");
+            }
+            _ => panic!("expected SupervisorError"),
+        }
     }
 
     #[test]

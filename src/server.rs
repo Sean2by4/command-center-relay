@@ -1,6 +1,9 @@
 ﻿use crate::audit::{self, AuditEvent};
 use crate::auth::AuthManager;
-use crate::broker::{Broker, ClientInfo, ConnTx, PendingDevice, WsMessage};
+use crate::broker::{
+    Broker, ClientInfo, ConnTx, PendingDevice, SupervisorQueryDecision, SupervisorResolveOutcome,
+    WsMessage,
+};
 use crate::device;
 use crate::protocol::{self, ControlMessage};
 use crate::push::PushManager;
@@ -527,6 +530,72 @@ async fn handle_control_message(
         ControlMessage::ReplayBegin => {
             if let ConnectionRole::Desktop { username } = role {
                 state.broker.begin_replay(username).await;
+            }
+        }
+
+        // Client supervisor query. Routed per the wire contract: desktop-offline
+        // fast-fail, stored-result replay, in-flight re-own, cap reject, else
+        // forward VERBATIM. `kind` is NEVER inspected by the relay.
+        ControlMessage::SupervisorQuery { id, .. } => {
+            if let ConnectionRole::Client { username, .. } = role {
+                // Step 1: desktop offline → synthesize error, no entry, no forward.
+                if !state.broker.is_desktop_online(username).await {
+                    let err = ControlMessage::SupervisorError {
+                        id: id.clone(),
+                        message: "desktop offline".into(),
+                    };
+                    let _ = outbound_tx
+                        .send(WsMessage::Text(serde_json::to_string(&err).unwrap()));
+                    return;
+                }
+                match state
+                    .broker
+                    .begin_supervisor_query(username, id, outbound_tx)
+                    .await
+                {
+                    // Steps 2/3: stored replay or in-flight re-own — no forward.
+                    SupervisorQueryDecision::Replay(stored) => {
+                        let _ = outbound_tx.send(WsMessage::Text(stored));
+                    }
+                    SupervisorQueryDecision::Reowned => {}
+                    // Step 4: over the pending cap.
+                    SupervisorQueryDecision::Capacity => {
+                        let err = ControlMessage::SupervisorError {
+                            id: id.clone(),
+                            message: "too many pending supervisor queries".into(),
+                        };
+                        let _ = outbound_tx
+                            .send(WsMessage::Text(serde_json::to_string(&err).unwrap()));
+                    }
+                    // Step 5: forward the query unchanged to the desktop.
+                    SupervisorQueryDecision::Forward => {
+                        let json = serde_json::to_string(msg).unwrap();
+                        let _ = state
+                            .broker
+                            .send_to_desktop(username, WsMessage::Text(json))
+                            .await;
+                    }
+                }
+            }
+        }
+
+        // Desktop supervisor reply: resolved to the requesting connection ONLY.
+        // Unknown id → drop + debug. Owner gone → parked for redelivery. Never
+        // broadcast.
+        ControlMessage::SupervisorResult { id, .. }
+        | ControlMessage::SupervisorError { id, .. } => {
+            if let ConnectionRole::Desktop { username } = role {
+                let json = serde_json::to_string(msg).unwrap();
+                if let SupervisorResolveOutcome::Unknown = state
+                    .broker
+                    .resolve_supervisor(username, id, WsMessage::Text(json))
+                    .await
+                {
+                    tracing::debug!(
+                        id = %id,
+                        "supervisor reply for unknown id; dropping"
+                    );
+                }
             }
         }
 
@@ -1418,5 +1487,197 @@ mod tests {
             _ => panic!("expected result on owner"),
         }
         assert!(xrx.try_recv().is_err(), "non-owner must not receive the result");
+    }
+
+    // --- Supervisor routing invariants ---
+
+    fn supervisor_query(id: &str, kind: &str) -> ControlMessage {
+        ControlMessage::SupervisorQuery {
+            id: id.into(),
+            kind: kind.into(),
+            session_id: None,
+            text: None,
+            last_fingerprint: None,
+        }
+    }
+
+    /// The relay never inspects `kind`: a query with an unknown kind is
+    /// forwarded to the desktop byte-for-byte.
+    #[tokio::test]
+    async fn test_supervisor_query_forwards_verbatim_ignoring_kind() {
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx, None).await.unwrap();
+
+        let (ctx, _crx) = test_conn();
+        let mut role = client_role();
+        let q = supervisor_query("sq-abc123def456", "zzz_unknown");
+        handle_control_message(&q, &mut role, &state, &ctx, "1.2.3.4").await;
+
+        match drx.recv().await.unwrap() {
+            WsMessage::Text(t) => {
+                let got: serde_json::Value = serde_json::from_str(&t).unwrap();
+                let want: serde_json::Value =
+                    serde_json::from_str(&serde_json::to_string(&q).unwrap()).unwrap();
+                assert_eq!(got, want, "query forwarded unchanged, kind untouched");
+                assert!(t.contains("zzz_unknown"));
+            }
+            _ => panic!("expected forward to desktop"),
+        }
+    }
+
+    /// Fanout-negative: two connections share a device_id; only the requesting
+    /// CONNECTION receives the result.
+    #[tokio::test]
+    async fn test_supervisor_result_routed_to_requester_only() {
+        let state = test_state();
+        let (owner, mut orx) = test_conn();
+        let (other, mut xrx) = test_conn();
+        let info = |dev: &str| ClientInfo {
+            device_id: dev.into(),
+            device_name: "d".into(),
+            ip: "1.2.3.4".into(),
+            connected_at: "now".into(),
+        };
+        // Same device_id on both connections (two tabs on one device).
+        state.broker.register_client("alice", owner.clone(), info("dev-1")).await.unwrap();
+        state.broker.register_client("alice", other.clone(), info("dev-1")).await.unwrap();
+
+        let (dtx, _drx) = test_conn();
+        state.broker.register_desktop("alice", dtx.clone(), None).await.unwrap();
+        let _ = orx.try_recv(); // drain desktop-online broadcast
+        let _ = xrx.try_recv();
+
+        let mut role = ConnectionRole::Client {
+            username: "alice".into(),
+            device_id: "dev-1".into(),
+        };
+        let q = supervisor_query("sq-fan1", "fleet_status");
+        handle_control_message(&q, &mut role, &state, &owner, "1.2.3.4").await;
+
+        let mut drole = ConnectionRole::Desktop { username: "alice".into() };
+        let res = ControlMessage::SupervisorResult {
+            id: "sq-fan1".into(),
+            payload: serde_json::json!({ "fleet": [] }),
+        };
+        handle_control_message(&res, &mut drole, &state, &dtx, "1.2.3.4").await;
+
+        match orx.recv().await.unwrap() {
+            WsMessage::Text(t) => assert!(t.contains("supervisor_result")),
+            _ => panic!("expected result on requester"),
+        }
+        assert!(
+            xrx.try_recv().is_err(),
+            "second tab on same device must receive nothing"
+        );
+    }
+
+    /// Suspend-reconnect: query on conn1 → conn1 receiver dropped → desktop
+    /// result stored → same id re-issued on conn2 → conn2 gets the stored
+    /// result exactly once and the entry is removed.
+    #[tokio::test]
+    async fn test_supervisor_suspend_reconnect_replays_stored_once() {
+        let state = test_state();
+        let (dtx, _drx) = test_conn();
+        state.broker.register_desktop("alice", dtx.clone(), None).await.unwrap();
+
+        // conn1 issues the query, then its receiver is dropped (tab suspended).
+        let (conn1, rx1) = test_conn();
+        let mut role1 = ConnectionRole::Client {
+            username: "alice".into(),
+            device_id: "dev-1".into(),
+        };
+        let q = supervisor_query("sq-susp", "summary");
+        handle_control_message(&q, &mut role1, &state, &conn1, "1.2.3.4").await;
+        drop(rx1);
+
+        // Desktop result arrives → owner send fails → stored.
+        let mut drole = ConnectionRole::Desktop { username: "alice".into() };
+        let res = ControlMessage::SupervisorResult {
+            id: "sq-susp".into(),
+            payload: serde_json::json!({ "status": "ok" }),
+        };
+        handle_control_message(&res, &mut drole, &state, &dtx, "1.2.3.4").await;
+
+        // conn2 re-issues the SAME id → the stored result replays to conn2.
+        let (conn2, mut rx2) = test_conn();
+        let mut role2 = ConnectionRole::Client {
+            username: "alice".into(),
+            device_id: "dev-2".into(),
+        };
+        handle_control_message(&q, &mut role2, &state, &conn2, "1.2.3.4").await;
+        match rx2.recv().await.unwrap() {
+            WsMessage::Text(t) => {
+                assert!(t.contains("supervisor_result"));
+                assert!(t.contains("\"status\":\"ok\""));
+            }
+            _ => panic!("expected stored result replayed"),
+        }
+        assert!(rx2.try_recv().is_err(), "stored result delivered exactly once");
+
+        // Entry removed: a second desktop result for the id is now unknown and
+        // reaches no one.
+        handle_control_message(&res, &mut drole, &state, &dtx, "1.2.3.4").await;
+        assert!(rx2.try_recv().is_err(), "entry removed after replay; no re-delivery");
+    }
+
+    /// Desktop-offline query → immediate relay-synthesized supervisor_error,
+    /// byte-shape-identical to a desktop-originated error.
+    #[tokio::test]
+    async fn test_supervisor_query_desktop_offline_synthesizes_error() {
+        let state = test_state();
+        // No desktop registered.
+        let (ctx, mut crx) = test_conn();
+        let mut role = client_role();
+        let q = supervisor_query("sq-off", "fleet_status");
+        handle_control_message(&q, &mut role, &state, &ctx, "1.2.3.4").await;
+
+        let relay_err = match crx.recv().await.unwrap() {
+            WsMessage::Text(t) => t,
+            _ => panic!("expected synthesized error"),
+        };
+        let desktop_err = serde_json::to_string(&ControlMessage::SupervisorError {
+            id: "sq-off".into(),
+            message: "desktop offline".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&relay_err).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&desktop_err).unwrap(),
+            "relay-synthesized error must be wire-identical to a desktop error"
+        );
+        assert!(relay_err.contains("supervisor_error"));
+        assert!(relay_err.contains("desktop offline"));
+    }
+
+    /// The 9th pending query for an account is rejected with a capacity error.
+    #[tokio::test]
+    async fn test_supervisor_query_cap_rejects_ninth() {
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx, None).await.unwrap();
+
+        let (ctx, mut crx) = test_conn();
+        let mut role = client_role();
+        for i in 0..8 {
+            let q = supervisor_query(&format!("sq-{i}"), "fleet_status");
+            handle_control_message(&q, &mut role, &state, &ctx, "1.2.3.4").await;
+        }
+        // All 8 forwarded to the desktop.
+        for _ in 0..8 {
+            assert!(matches!(drx.recv().await.unwrap(), WsMessage::Text(_)));
+        }
+
+        // 9th distinct id → capacity error to requester, nothing to desktop.
+        let q9 = supervisor_query("sq-9", "fleet_status");
+        handle_control_message(&q9, &mut role, &state, &ctx, "1.2.3.4").await;
+        assert!(drx.try_recv().is_err(), "9th query must not forward");
+        match crx.recv().await.unwrap() {
+            WsMessage::Text(t) => {
+                assert!(t.contains("supervisor_error"));
+                assert!(t.contains("too many pending supervisor queries"));
+            }
+            _ => panic!("expected capacity error"),
+        }
     }
 }

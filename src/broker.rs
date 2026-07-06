@@ -147,6 +147,46 @@ struct UploadEntry {
     finished: bool,
 }
 
+/// One pending supervisor query, keyed by the client-minted query id. The
+/// result/error is routed back to the exact owning CONNECTION; if that
+/// connection is gone when the desktop answers, the serialized reply is parked
+/// in `stored` for redelivery when the same id is re-issued after reconnect.
+struct SupervisorEntry {
+    /// The exact client connection that owns this query (result target).
+    owner: ConnTx,
+    /// A desktop reply that arrived while the owner was gone, held for the
+    /// redelivery window until the same id is re-queried (or GC).
+    stored: Option<String>,
+    /// Creation time (for the 300s GC — tool-loops can exceed 60s).
+    created: Instant,
+}
+
+/// Relay routing decision for a `supervisor_query` from a client.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SupervisorQueryDecision {
+    /// A stored reply exists for this id — the caller replays it to the
+    /// requester and does NOT forward to the desktop.
+    Replay(String),
+    /// The id is in-flight and was re-owned to the requesting connection — do
+    /// not forward.
+    Reowned,
+    /// The account is at the pending cap — the caller synthesizes an error.
+    Capacity,
+    /// A fresh entry was inserted — the caller forwards the query VERBATIM.
+    Forward,
+}
+
+/// Outcome of resolving a desktop supervisor reply.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SupervisorResolveOutcome {
+    /// Delivered to the owning connection; entry removed.
+    Delivered,
+    /// Owner connection gone — reply parked for redelivery.
+    Stored,
+    /// No pending entry for this id — caller drops the reply.
+    Unknown,
+}
+
 /// Outcome of governing a single `PTY_FILE_CHUNK`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ChunkDecision {
@@ -166,6 +206,8 @@ struct AccountState {
     desktop_capabilities: Option<Vec<String>>,
     /// Active file uploads keyed by upload_id.
     uploads: HashMap<String, UploadEntry>,
+    /// Pending supervisor queries keyed by query id.
+    supervisor_pending: HashMap<String, SupervisorEntry>,
     clients: Vec<ClientConnection>,
     pending_devices: Vec<PendingDevice>,
     /// Connections whose session_list_request has been forwarded to the
@@ -184,6 +226,7 @@ impl AccountState {
             desktop_tx: None,
             desktop_capabilities: None,
             uploads: HashMap::new(),
+            supervisor_pending: HashMap::new(),
             clients: Vec::new(),
             pending_devices: Vec::new(),
             replay_queue: VecDeque::new(),
@@ -201,6 +244,11 @@ const MAX_UPLOAD_SIZE: u64 = 25 * 1024 * 1024;
 const MAX_ACTIVE_UPLOADS: usize = 8;
 /// Uploads with no activity for this long are garbage-collected.
 const UPLOAD_IDLE_TIMEOUT_SECS: u64 = 60;
+/// Max concurrent pending supervisor queries per account.
+const MAX_PENDING_SUPERVISOR: usize = 8;
+/// Supervisor entries older than this (created-based) are garbage-collected.
+/// 300s (not 60s): P3 chat tool-loops can exceed 60s.
+const SUPERVISOR_GC_SECS: u64 = 300;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerError {
@@ -588,6 +636,88 @@ impl Broker {
         let state = accounts.get_mut(username)?;
         Self::gc_uploads(state);
         state.uploads.remove(upload_id).map(|e| e.owner)
+    }
+
+    /// Drop supervisor entries older than the GC window (created-based). Called
+    /// opportunistically on every supervisor message (no periodic sweep task,
+    /// mirroring `gc_uploads`).
+    fn gc_supervisor(state: &mut AccountState) {
+        let now = Instant::now();
+        state
+            .supervisor_pending
+            .retain(|_, e| now.duration_since(e.created).as_secs() < SUPERVISOR_GC_SECS);
+    }
+
+    /// Route a `supervisor_query` from a client. Implements steps 2–5 of the
+    /// wire contract (step 1, desktop-offline, is handled by the caller):
+    /// stored-result replay, in-flight re-own, cap reject, else insert. The
+    /// `kind` is never inspected here — routing is purely by `id`.
+    pub async fn begin_supervisor_query(
+        &self,
+        username: &str,
+        id: &str,
+        conn: &ConnTx,
+    ) -> SupervisorQueryDecision {
+        let mut accounts = self.accounts.write().await;
+        let state = accounts
+            .entry(username.to_string())
+            .or_insert_with(AccountState::new);
+        Self::gc_supervisor(state);
+        if let Some(entry) = state.supervisor_pending.get_mut(id) {
+            // Step 2: a reply is parked → replay to this connection, remove entry.
+            if let Some(stored) = entry.stored.take() {
+                state.supervisor_pending.remove(id);
+                return SupervisorQueryDecision::Replay(stored);
+            }
+            // Step 3: in-flight → re-own to the (re)issuing connection.
+            entry.owner = conn.clone();
+            return SupervisorQueryDecision::Reowned;
+        }
+        // Step 4: cap.
+        if state.supervisor_pending.len() >= MAX_PENDING_SUPERVISOR {
+            return SupervisorQueryDecision::Capacity;
+        }
+        // Step 5: insert.
+        state.supervisor_pending.insert(
+            id.to_string(),
+            SupervisorEntry {
+                owner: conn.clone(),
+                stored: None,
+                created: Instant::now(),
+            },
+        );
+        SupervisorQueryDecision::Forward
+    }
+
+    /// Resolve a desktop `supervisor_result` / `supervisor_error` by id. Tries
+    /// to deliver to the owning connection; on success removes the entry, on
+    /// send failure parks the serialized reply for redelivery. Unknown id →
+    /// caller drops. NEVER broadcasts.
+    pub async fn resolve_supervisor(
+        &self,
+        username: &str,
+        id: &str,
+        msg: WsMessage,
+    ) -> SupervisorResolveOutcome {
+        let mut accounts = self.accounts.write().await;
+        let Some(state) = accounts.get_mut(username) else {
+            return SupervisorResolveOutcome::Unknown;
+        };
+        Self::gc_supervisor(state);
+        let Some(entry) = state.supervisor_pending.get_mut(id) else {
+            return SupervisorResolveOutcome::Unknown;
+        };
+        let serialized = match &msg {
+            WsMessage::Text(t) => t.clone(),
+            _ => String::new(),
+        };
+        if entry.owner.send(msg).is_ok() {
+            state.supervisor_pending.remove(id);
+            SupervisorResolveOutcome::Delivered
+        } else {
+            entry.stored = Some(serialized);
+            SupervisorResolveOutcome::Stored
+        }
     }
 
     /// Broadcast a message from the desktop to all connected clients.
@@ -1287,5 +1417,83 @@ mod tests {
             }
             _ => panic!("expected text"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_query_decision_lifecycle() {
+        let broker = Broker::new();
+        let (owner, _orx) = test_conn();
+
+        // First query for an id → inserted, forward to desktop.
+        assert_eq!(
+            broker.begin_supervisor_query("alice", "sq-1", &owner).await,
+            SupervisorQueryDecision::Forward
+        );
+        // Same id in-flight, re-issued from another connection → re-owned.
+        let (owner2, mut orx2) = test_conn();
+        assert_eq!(
+            broker.begin_supervisor_query("alice", "sq-1", &owner2).await,
+            SupervisorQueryDecision::Reowned
+        );
+        // Desktop reply is delivered to the current owner (owner2), entry cleared.
+        assert_eq!(
+            broker
+                .resolve_supervisor("alice", "sq-1", WsMessage::Text("r".into()))
+                .await,
+            SupervisorResolveOutcome::Delivered
+        );
+        assert!(matches!(orx2.try_recv().unwrap(), WsMessage::Text(t) if t == "r"));
+        // Entry gone → a second resolve is unknown.
+        assert_eq!(
+            broker
+                .resolve_supervisor("alice", "sq-1", WsMessage::Text("r".into()))
+                .await,
+            SupervisorResolveOutcome::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_store_then_replay_on_reconnect() {
+        let broker = Broker::new();
+        let (conn1, rx1) = test_conn();
+        assert_eq!(
+            broker.begin_supervisor_query("alice", "sq-x", &conn1).await,
+            SupervisorQueryDecision::Forward
+        );
+        // Owner's receiver is gone → desktop reply is parked, not delivered.
+        drop(rx1);
+        assert_eq!(
+            broker
+                .resolve_supervisor("alice", "sq-x", WsMessage::Text("payload".into()))
+                .await,
+            SupervisorResolveOutcome::Stored
+        );
+        // Same id re-issued from a new connection → the parked reply replays.
+        let (conn2, _rx2) = test_conn();
+        assert_eq!(
+            broker.begin_supervisor_query("alice", "sq-x", &conn2).await,
+            SupervisorQueryDecision::Replay("payload".into())
+        );
+        // Entry removed after replay: re-issuing again inserts fresh (Forward).
+        assert_eq!(
+            broker.begin_supervisor_query("alice", "sq-x", &conn2).await,
+            SupervisorQueryDecision::Forward
+        );
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_cap_rejects_ninth() {
+        let broker = Broker::new();
+        let (owner, _orx) = test_conn();
+        for i in 0..MAX_PENDING_SUPERVISOR {
+            assert_eq!(
+                broker.begin_supervisor_query("alice", &format!("sq-{i}"), &owner).await,
+                SupervisorQueryDecision::Forward
+            );
+        }
+        assert_eq!(
+            broker.begin_supervisor_query("alice", "sq-extra", &owner).await,
+            SupervisorQueryDecision::Capacity
+        );
     }
 }
