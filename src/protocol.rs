@@ -20,6 +20,17 @@ pub struct SessionInfo {
     pub rows: u16,
     #[serde(rename = "createdAt", default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
+    #[serde(rename = "accountId", default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+}
+
+/// Account roster entry carried on `session_list`. Opaque to the relay —
+/// mirrored across transit so PWA clients can render account chrome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountMeta {
+    pub id: String,
+    pub color: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,11 +119,20 @@ pub enum ControlMessage {
 
     // --- Sessions ---
     #[serde(rename = "session_spawn_request")]
-    SessionSpawnRequest { cols: u16, rows: u16 },
+    SessionSpawnRequest {
+        cols: u16,
+        rows: u16,
+        #[serde(rename = "accountId", default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
+    },
     #[serde(rename = "session_list_request")]
     SessionListRequest,
     #[serde(rename = "session_list")]
-    SessionList { sessions: Vec<SessionInfo> },
+    SessionList {
+        sessions: Vec<SessionInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accounts: Option<Vec<AccountMeta>>,
+    },
     #[serde(rename = "session_created")]
     SessionCreated {
         #[serde(rename = "sessionId")]
@@ -127,6 +147,8 @@ pub enum ControlMessage {
         cols: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rows: Option<u16>,
+        #[serde(rename = "accountId", default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
     },
     #[serde(rename = "session_renamed")]
     SessionRenamed {
@@ -452,17 +474,120 @@ mod tests {
                 cols: 120,
                 rows: 40,
                 created_at: Some(1719700000000),
+                account_id: None,
             }],
+            accounts: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
         match parsed {
-            ControlMessage::SessionList { sessions } => {
+            ControlMessage::SessionList { sessions, .. } => {
                 assert_eq!(sessions.len(), 1);
                 assert_eq!(sessions[0].label, "Session 1");
             }
             _ => panic!("expected SessionList"),
         }
+    }
+
+    #[test]
+    fn test_session_spawn_request_account_id_roundtrips() {
+        // Present accountId survives parse → re-serialize.
+        let json = r#"{"type":"session_spawn_request","cols":80,"rows":24,"accountId":"acct-7"}"#;
+        let parsed: ControlMessage = serde_json::from_str(json).unwrap();
+        match &parsed {
+            ControlMessage::SessionSpawnRequest { cols, rows, account_id } => {
+                assert_eq!(*cols, 80);
+                assert_eq!(*rows, 24);
+                assert_eq!(account_id.as_deref(), Some("acct-7"));
+            }
+            _ => panic!("expected SessionSpawnRequest"),
+        }
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
+    }
+
+    #[test]
+    fn test_session_spawn_request_without_account_id_backcompat() {
+        // Old clients omit accountId — parses, and re-serializes identically.
+        let json = r#"{"type":"session_spawn_request","cols":80,"rows":24}"#;
+        let parsed: ControlMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            parsed,
+            ControlMessage::SessionSpawnRequest { account_id: None, .. }
+        ));
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
+    }
+
+    #[test]
+    fn test_session_created_account_id_roundtrips() {
+        let json = r#"{"type":"session_created","sessionId":"s1","label":"L","accountId":"acct-3"}"#;
+        let parsed: ControlMessage = serde_json::from_str(json).unwrap();
+        match &parsed {
+            ControlMessage::SessionCreated { account_id, .. } => {
+                assert_eq!(account_id.as_deref(), Some("acct-3"));
+            }
+            _ => panic!("expected SessionCreated"),
+        }
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
+    }
+
+    #[test]
+    fn test_session_created_without_account_id_backcompat() {
+        // Old desktops send neither accountId nor dims.
+        let json = r#"{"type":"session_created","sessionId":"s1","label":"L"}"#;
+        let parsed: ControlMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            parsed,
+            ControlMessage::SessionCreated { account_id: None, .. }
+        ));
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
+    }
+
+    #[test]
+    fn test_session_list_per_entry_account_id_and_roster_roundtrips() {
+        // Per-entry accountId + a multi-entry accounts roster survive transit.
+        let json = r##"{"type":"session_list","sessions":[{"id":"a","label":"L1","cwd":"/","cols":80,"rows":24,"accountId":"acct-1"}],"accounts":[{"id":"acct-1","color":"#ff0000","status":"active"},{"id":"acct-2","color":"#00ff00","status":"idle"}]}"##;
+        let parsed: ControlMessage = serde_json::from_str(json).unwrap();
+        match &parsed {
+            ControlMessage::SessionList { sessions, accounts } => {
+                assert_eq!(sessions[0].account_id.as_deref(), Some("acct-1"));
+                let roster = accounts.as_ref().expect("accounts present");
+                assert_eq!(roster.len(), 2);
+                assert_eq!(roster[0].id, "acct-1");
+                assert_eq!(roster[0].color, "#ff0000");
+                assert_eq!(roster[0].status, "active");
+                assert_eq!(roster[1].id, "acct-2");
+            }
+            _ => panic!("expected SessionList"),
+        }
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
+    }
+
+    #[test]
+    fn test_session_list_without_new_fields_backcompat() {
+        // Old desktop: no per-entry accountId, no accounts roster. Re-serializes
+        // byte-identically to the input shape.
+        let json = r#"{"type":"session_list","sessions":[{"id":"a","label":"L1","cwd":"/","cols":80,"rows":24}]}"#;
+        let parsed: ControlMessage = serde_json::from_str(json).unwrap();
+        match &parsed {
+            ControlMessage::SessionList { sessions, accounts } => {
+                assert!(sessions[0].account_id.is_none());
+                assert!(accounts.is_none());
+            }
+            _ => panic!("expected SessionList"),
+        }
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
     }
 
     #[test]
