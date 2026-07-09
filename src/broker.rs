@@ -150,6 +150,23 @@ struct UploadEntry {
     buffer: Option<Vec<u8>>,
 }
 
+/// One in-flight desktop→client file download, governed at the relay so a
+/// misbehaving desktop can't stream unbounded bytes or leak download slots.
+/// The mirror image of `UploadEntry`: here the OWNER is the requesting client
+/// connection and the byte stream flows the other way.
+struct DownloadEntry {
+    /// The exact client CONNECTION that requested this download. `begin`, `end`
+    /// and chunk traffic are routed ONLY to this connection.
+    owner: ConnTx,
+    /// Size the desktop declared in `file_download_begin`; `None` until begin
+    /// passes through (a failure `end` can arrive with no preceding begin).
+    declared_size: Option<u64>,
+    /// Payload bytes forwarded to the client so far.
+    bytes_forwarded: u64,
+    /// Last time any message touched this download (for idle GC).
+    last_activity: Instant,
+}
+
 /// One pending supervisor query, keyed by the client-minted query id. The
 /// result/error is routed back to the exact owning CONNECTION; if that
 /// connection is gone when the desktop answers, the serialized reply is parked
@@ -202,6 +219,20 @@ pub enum ChunkDecision {
     Overrun,
 }
 
+/// Outcome of governing a single `PTY_FILE_DOWNLOAD_CHUNK` from the desktop.
+/// Each variant carries the owning client connection to route to (except
+/// `Drop`, where no owner is known).
+#[derive(Debug)]
+pub enum DownloadChunkDecision {
+    /// Owned by an active download and within budget — forward to the owner.
+    Forward(ConnTx),
+    /// No active download for this id (unknown/finished/severed) — drop.
+    Drop,
+    /// Byte budget exceeded — the download was severed; the caller sends a
+    /// relay-originated failure `file_download_end` to the owner.
+    Overrun(ConnTx),
+}
+
 /// Per-account state tracked by the broker.
 struct AccountState {
     desktop_tx: Option<ConnTx>,
@@ -209,6 +240,8 @@ struct AccountState {
     desktop_capabilities: Option<Vec<String>>,
     /// Active file uploads keyed by upload_id.
     uploads: HashMap<String, UploadEntry>,
+    /// Active file downloads keyed by download_id.
+    downloads: HashMap<String, DownloadEntry>,
     /// Pending supervisor queries keyed by query id.
     supervisor_pending: HashMap<String, SupervisorEntry>,
     clients: Vec<ClientConnection>,
@@ -229,6 +262,7 @@ impl AccountState {
             desktop_tx: None,
             desktop_capabilities: None,
             uploads: HashMap::new(),
+            downloads: HashMap::new(),
             supervisor_pending: HashMap::new(),
             clients: Vec::new(),
             pending_devices: Vec::new(),
@@ -245,7 +279,11 @@ const MAX_REPLAY_QUEUE: usize = 64;
 const MAX_UPLOAD_SIZE: u64 = 25 * 1024 * 1024;
 /// Max concurrent uploads per account.
 const MAX_ACTIVE_UPLOADS: usize = 8;
-/// Uploads with no activity for this long are garbage-collected.
+/// Hard cap on a single download's forwarded bytes (also caps the declared size).
+const MAX_DOWNLOAD_SIZE: u64 = 25 * 1024 * 1024;
+/// Max concurrent downloads per account.
+const MAX_ACTIVE_DOWNLOADS: usize = 4;
+/// Uploads (and downloads) with no activity for this long are garbage-collected.
 const UPLOAD_IDLE_TIMEOUT_SECS: u64 = 60;
 /// Max concurrent pending supervisor queries per account.
 const MAX_PENDING_SUPERVISOR: usize = 8;
@@ -456,6 +494,9 @@ impl Broker {
             state.replay_queue.retain(|r| !r.tx.same_conn(conn));
             // Drop any uploads this connection owned so their slots free up.
             state.uploads.retain(|_, e| !e.owner.same_conn(conn));
+            // Same for downloads it requested — a client that closes mid-stream
+            // must not hold its download slot until the idle sweep.
+            state.downloads.retain(|_, e| !e.owner.same_conn(conn));
             // A mid-burst disconnect leaves replay_target pointing at the
             // gone connection on purpose: the remaining frames of that burst
             // drop harmlessly instead of broadcasting to everyone, and the
@@ -684,6 +725,102 @@ impl Broker {
         let state = accounts.get_mut(username)?;
         Self::gc_uploads(state);
         state.uploads.remove(upload_id).map(|e| e.owner)
+    }
+
+    /// Drop downloads idle past the timeout. Called lazily on every download
+    /// message for the account (mirrors `gc_uploads`; no periodic sweep task).
+    fn gc_downloads(state: &mut AccountState) {
+        let now = Instant::now();
+        state
+            .downloads
+            .retain(|_, e| now.duration_since(e.last_activity).as_secs() < UPLOAD_IDLE_TIMEOUT_SECS);
+    }
+
+    /// Govern a `file_download_request` from a client. Registers
+    /// `download_id → requesting connection` so begin/end/chunk traffic can be
+    /// routed back. Returns Ok to forward the request to the desktop, or
+    /// Err(reason) — the caller then synthesizes a failure `file_download_end`
+    /// to the requesting client and does NOT forward.
+    pub async fn register_download(
+        &self,
+        username: &str,
+        download_id: &str,
+        conn: &ConnTx,
+    ) -> Result<(), &'static str> {
+        let mut accounts = self.accounts.write().await;
+        let state = accounts
+            .entry(username.to_string())
+            .or_insert_with(AccountState::new);
+        Self::gc_downloads(state);
+        if state.downloads.len() >= MAX_ACTIVE_DOWNLOADS {
+            return Err("too many active downloads");
+        }
+        state.downloads.insert(
+            download_id.to_string(),
+            DownloadEntry {
+                owner: conn.clone(),
+                declared_size: None,
+                bytes_forwarded: 0,
+                last_activity: Instant::now(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Route a `file_download_begin` from the desktop: record the declared size
+    /// for byte budgeting and return the owning client connection. None means
+    /// the download_id is unknown — the caller drops the begin.
+    pub async fn note_download_begin(
+        &self,
+        username: &str,
+        download_id: &str,
+        size: u64,
+    ) -> Option<ConnTx> {
+        let mut accounts = self.accounts.write().await;
+        let state = accounts.get_mut(username)?;
+        Self::gc_downloads(state);
+        let entry = state.downloads.get_mut(download_id)?;
+        entry.declared_size = Some(size);
+        entry.last_activity = Instant::now();
+        Some(entry.owner.clone())
+    }
+
+    /// Govern one `PTY_FILE_DOWNLOAD_CHUNK` from the desktop. Accounts the bytes
+    /// against the declared size / `MAX_DOWNLOAD_SIZE` and severs the download
+    /// on overrun. See `DownloadChunkDecision`.
+    pub async fn record_download_chunk(
+        &self,
+        username: &str,
+        download_id: &str,
+        payload: &[u8],
+    ) -> DownloadChunkDecision {
+        let mut accounts = self.accounts.write().await;
+        let Some(state) = accounts.get_mut(username) else {
+            return DownloadChunkDecision::Drop;
+        };
+        Self::gc_downloads(state);
+        let Some(entry) = state.downloads.get_mut(download_id) else {
+            return DownloadChunkDecision::Drop;
+        };
+        entry.bytes_forwarded += payload.len() as u64;
+        entry.last_activity = Instant::now();
+        let budget = entry.declared_size.unwrap_or(MAX_DOWNLOAD_SIZE).min(MAX_DOWNLOAD_SIZE);
+        if entry.bytes_forwarded > budget {
+            let owner = entry.owner.clone();
+            state.downloads.remove(download_id);
+            return DownloadChunkDecision::Overrun(owner);
+        }
+        DownloadChunkDecision::Forward(entry.owner.clone())
+    }
+
+    /// Resolve a `file_download_end` from the desktop: remove the download's
+    /// governance entry and return the owning connection to route the end to.
+    /// None means the owner is gone/unknown — the caller drops the end.
+    pub async fn resolve_download(&self, username: &str, download_id: &str) -> Option<ConnTx> {
+        let mut accounts = self.accounts.write().await;
+        let state = accounts.get_mut(username)?;
+        Self::gc_downloads(state);
+        state.downloads.remove(download_id).map(|e| e.owner)
     }
 
     /// Drop supervisor entries older than the GC window (created-based). Called
@@ -1409,6 +1546,104 @@ mod tests {
         broker.unregister_client("alice", "dev-1", &tx).await;
         // The upload slot is freed — the id is no longer active.
         assert!(broker.resolve_upload("alice", "u1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_download_register_rejects_fifth_concurrent() {
+        let broker = Broker::new();
+        let (tx, _rx) = test_conn();
+        for i in 0..MAX_ACTIVE_DOWNLOADS {
+            broker
+                .register_download("alice", &format!("d{i}"), &tx)
+                .await
+                .unwrap();
+        }
+        let err = broker
+            .register_download("alice", "d-extra", &tx)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "too many active downloads");
+    }
+
+    #[tokio::test]
+    async fn test_download_begin_and_end_route_to_owner_only() {
+        let broker = Broker::new();
+        let (owner, _orx) = test_conn();
+        let (other, _xrx) = test_conn();
+        broker.register_download("alice", "d1", &owner).await.unwrap();
+
+        // begin records the declared size and returns the owner.
+        let begin_owner = broker.note_download_begin("alice", "d1", 4096).await.unwrap();
+        assert!(begin_owner.same_conn(&owner));
+        assert!(!begin_owner.same_conn(&other));
+
+        // end removes the entry and returns the owner.
+        let end_owner = broker.resolve_download("alice", "d1").await.unwrap();
+        assert!(end_owner.same_conn(&owner));
+        // Entry is cleared: a second resolve finds nothing.
+        assert!(broker.resolve_download("alice", "d1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_download_chunk_routes_to_owner_and_forwards() {
+        let broker = Broker::new();
+        let (owner, _orx) = test_conn();
+        broker.register_download("alice", "d1", &owner).await.unwrap();
+        broker.note_download_begin("alice", "d1", 4096).await.unwrap();
+
+        match broker.record_download_chunk("alice", "d1", &[0u8; 512]).await {
+            DownloadChunkDecision::Forward(tx) => assert!(tx.same_conn(&owner)),
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_download_chunk_without_download_is_dropped() {
+        let broker = Broker::new();
+        assert!(matches!(
+            broker.record_download_chunk("alice", "ghost", &[0u8; 512]).await,
+            DownloadChunkDecision::Drop
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_download_chunk_overrun_severs_download() {
+        let broker = Broker::new();
+        let (owner, _orx) = test_conn();
+        broker.register_download("alice", "d1", &owner).await.unwrap();
+        broker.note_download_begin("alice", "d1", 1000).await.unwrap();
+        // Within budget.
+        assert!(matches!(
+            broker.record_download_chunk("alice", "d1", &[0u8; 800]).await,
+            DownloadChunkDecision::Forward(_)
+        ));
+        // Exceeds declared size → overrun; download state is dropped, owner returned.
+        match broker.record_download_chunk("alice", "d1", &[0u8; 300]).await {
+            DownloadChunkDecision::Overrun(tx) => assert!(tx.same_conn(&owner)),
+            other => panic!("expected Overrun, got {other:?}"),
+        }
+        // Now there's no active download — subsequent chunks are dropped.
+        assert!(matches!(
+            broker.record_download_chunk("alice", "d1", &[0u8; 10]).await,
+            DownloadChunkDecision::Drop
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_download_cleared_when_owner_disconnects() {
+        let broker = Broker::new();
+        let (tx, _rx) = test_conn();
+        let info = ClientInfo {
+            device_id: "dev-1".into(),
+            device_name: "Phone".into(),
+            ip: "1.2.3.4".into(),
+            connected_at: "now".into(),
+        };
+        broker.register_client("alice", tx.clone(), info).await.unwrap();
+        broker.register_download("alice", "d1", &tx).await.unwrap();
+        broker.unregister_client("alice", "dev-1", &tx).await;
+        // The download slot is freed — the id is no longer active.
+        assert!(broker.resolve_download("alice", "d1").await.is_none());
     }
 
     #[tokio::test]

@@ -7,6 +7,9 @@ pub const PTY_SCROLLBACK: u8 = 0x03;
 /// A chunk of a client→desktop file upload. The 36-byte session-id slot holds
 /// the upload UUID; the payload is a slice of the file bytes.
 pub const PTY_FILE_CHUNK: u8 = 0x04;
+/// A chunk of a desktop→client file download. The 36-byte session-id slot holds
+/// the download UUID; the payload is a slice of the file bytes.
+pub const PTY_FILE_DOWNLOAD_CHUNK: u8 = 0x05;
 
 /// Binary frame: [1 byte type][36 bytes session UUID as ASCII][N bytes payload]
 pub const BINARY_HEADER_LEN: usize = 1 + 36;
@@ -264,6 +267,36 @@ pub enum ControlMessage {
         error: Option<String>,
     },
 
+    // --- File download (desktop → client, chunked over binary PTY_FILE_DOWNLOAD_CHUNK) ---
+    /// Client asks the desktop to send a file it rendered in terminal output.
+    /// The relay governs it and forwards to the desktop. `download_id` keys the
+    /// binary chunk stream and the begin/end results.
+    #[serde(rename = "file_download_request")]
+    FileDownloadRequest {
+        download_id: String,
+        session_id: String,
+        path: String,
+    },
+    /// Desktop announces the file it is about to stream; routed to the
+    /// requesting client connection only.
+    #[serde(rename = "file_download_begin")]
+    FileDownloadBegin {
+        download_id: String,
+        name: String,
+        size: u64,
+        mime: String,
+    },
+    /// Desktop (or the relay, on rejection/overrun) reports the download
+    /// outcome; routed to the requesting client connection only. Sent for both
+    /// success (after the last chunk) and failure (may arrive with no begin).
+    #[serde(rename = "file_download_end")]
+    FileDownloadEnd {
+        download_id: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
     // --- Supervisor (client → relay → desktop; result/error → requester only) ---
     /// Client asks the desktop a supervisor question. Forwarded VERBATIM to the
     /// desktop by the relay — `kind` is OPAQUE and never matched relay-side.
@@ -336,7 +369,10 @@ pub fn parse_binary_frame(data: &[u8]) -> Result<(u8, String, &[u8]), ProtocolEr
         });
     }
     let frame_type = data[0];
-    if !matches!(frame_type, PTY_OUTPUT | PTY_INPUT | PTY_SCROLLBACK | PTY_FILE_CHUNK) {
+    if !matches!(
+        frame_type,
+        PTY_OUTPUT | PTY_INPUT | PTY_SCROLLBACK | PTY_FILE_CHUNK | PTY_FILE_DOWNLOAD_CHUNK
+    ) {
         return Err(ProtocolError::UnknownFrameType(frame_type));
     }
     let id_bytes = &data[1..37];
@@ -599,6 +635,92 @@ mod tests {
         assert_eq!(ftype, PTY_FILE_CHUNK);
         assert_eq!(id, upload_id);
         assert_eq!(data, payload);
+    }
+
+    #[test]
+    fn test_file_download_chunk_frame_roundtrips() {
+        let download_id = uuid::Uuid::new_v4().to_string();
+        let payload = b"download bytes";
+        let frame = build_binary_frame(PTY_FILE_DOWNLOAD_CHUNK, &download_id, payload);
+        let (ftype, id, data) = parse_binary_frame(&frame).unwrap();
+        assert_eq!(ftype, PTY_FILE_DOWNLOAD_CHUNK);
+        assert_eq!(id, download_id);
+        assert_eq!(data, payload);
+    }
+
+    #[test]
+    fn test_file_download_request_wire_shape() {
+        let json = r#"{"type":"file_download_request","download_id":"d1","session_id":"s1","path":"/home/sean/a.md"}"#;
+        let msg: ControlMessage = serde_json::from_str(json).unwrap();
+        match &msg {
+            ControlMessage::FileDownloadRequest {
+                download_id,
+                session_id,
+                path,
+            } => {
+                assert_eq!(download_id, "d1");
+                assert_eq!(session_id, "s1");
+                assert_eq!(path, "/home/sean/a.md");
+            }
+            _ => panic!("expected FileDownloadRequest"),
+        }
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
+    }
+
+    #[test]
+    fn test_file_download_begin_roundtrips() {
+        let msg = ControlMessage::FileDownloadBegin {
+            download_id: "d1".into(),
+            name: "report.md".into(),
+            size: 2048,
+            mime: "text/markdown".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"file_download_begin\""));
+        assert!(json.contains("\"size\":2048"));
+        let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ControlMessage::FileDownloadBegin { download_id, name, size, mime } => {
+                assert_eq!(download_id, "d1");
+                assert_eq!(name, "report.md");
+                assert_eq!(size, 2048);
+                assert_eq!(mime, "text/markdown");
+            }
+            _ => panic!("expected FileDownloadBegin"),
+        }
+    }
+
+    #[test]
+    fn test_file_download_end_omits_error_on_success() {
+        // Success: error is omitted entirely.
+        let ok = ControlMessage::FileDownloadEnd {
+            download_id: "d1".into(),
+            ok: true,
+            error: None,
+        };
+        let json = serde_json::to_string(&ok).unwrap();
+        assert!(json.contains("\"ok\":true"));
+        assert!(!json.contains("error"));
+
+        // Failure: error is present and round-trips.
+        let fail = ControlMessage::FileDownloadEnd {
+            download_id: "d1".into(),
+            ok: false,
+            error: Some("not found".into()),
+        };
+        let json = serde_json::to_string(&fail).unwrap();
+        assert!(json.contains("\"ok\":false"));
+        let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ControlMessage::FileDownloadEnd { download_id, ok, error } => {
+                assert_eq!(download_id, "d1");
+                assert!(!ok);
+                assert_eq!(error.unwrap(), "not found");
+            }
+            _ => panic!("expected FileDownloadEnd"),
+        }
     }
 
     #[test]

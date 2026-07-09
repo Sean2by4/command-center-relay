@@ -741,6 +741,78 @@ async fn handle_control_message(
             }
         }
 
+        // Client asks the desktop for a file it rendered in terminal output.
+        // The relay registers ownership and enforces the active-download cap
+        // before forwarding; a cap rejection is answered with a relay-originated
+        // failure end to the requester only. Ignored from a desktop.
+        ControlMessage::FileDownloadRequest { download_id, .. } => {
+            if let ConnectionRole::Client { username, .. } = role {
+                match state
+                    .broker
+                    .register_download(username, download_id, outbound_tx)
+                    .await
+                {
+                    Ok(()) => {
+                        let json = serde_json::to_string(msg).unwrap();
+                        let _ = state
+                            .broker
+                            .send_to_desktop(username, WsMessage::Text(json))
+                            .await;
+                    }
+                    Err(reason) => {
+                        let fail = ControlMessage::FileDownloadEnd {
+                            download_id: download_id.clone(),
+                            ok: false,
+                            error: Some(reason.to_string()),
+                        };
+                        let _ = outbound_tx.send(WsMessage::Text(
+                            serde_json::to_string(&fail).unwrap(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Desktop announces the file stream: routed to the requesting client
+        // connection ONLY, recording the declared size for chunk budgeting.
+        // Unknown download_id → drop + warn. Ignored from a client.
+        ControlMessage::FileDownloadBegin { download_id, size, .. } => {
+            if let ConnectionRole::Desktop { username } = role {
+                match state.broker.note_download_begin(username, download_id, *size).await {
+                    Some(tx) => {
+                        let json = serde_json::to_string(msg).unwrap();
+                        let _ = tx.send(WsMessage::Text(json));
+                    }
+                    None => {
+                        tracing::warn!(
+                            download_id = %download_id,
+                            "file_download_begin for unknown download; dropping"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Desktop reports the download outcome (success or failure): routed to
+        // the requesting client connection ONLY, clearing governance state.
+        // Unknown download_id → drop + warn. Ignored from a client.
+        ControlMessage::FileDownloadEnd { download_id, .. } => {
+            if let ConnectionRole::Desktop { username } = role {
+                match state.broker.resolve_download(username, download_id).await {
+                    Some(tx) => {
+                        let json = serde_json::to_string(msg).unwrap();
+                        let _ = tx.send(WsMessage::Text(json));
+                    }
+                    None => {
+                        tracing::warn!(
+                            download_id = %download_id,
+                            "file_download_end for unknown download; dropping"
+                        );
+                    }
+                }
+            }
+        }
+
         // List requests are queued so the desktop's reply burst (replay_begin
         // + scrollback + session_list) can be routed back to the requester
         // only, instead of resetting every connected client's terminal.
@@ -1415,6 +1487,33 @@ async fn handle_binary_message(
                         }
                         ChunkDecision::Forward | ChunkDecision::Drop => {}
                     }
+                } else if frame_type == protocol::PTY_FILE_DOWNLOAD_CHUNK {
+                    // Chunks of a desktop→client download: routed to the
+                    // requesting client connection ONLY, within the download's
+                    // byte budget. Unknown/severed download_id → drop; an
+                    // overrun severs the download and sends a relay-originated
+                    // failure end to the owner.
+                    use crate::broker::DownloadChunkDecision;
+                    match state
+                        .broker
+                        .record_download_chunk(username, &upload_id, payload)
+                        .await
+                    {
+                        DownloadChunkDecision::Forward(tx) => {
+                            let _ = tx.send(WsMessage::Binary(data.to_vec()));
+                        }
+                        DownloadChunkDecision::Overrun(tx) => {
+                            let fail = ControlMessage::FileDownloadEnd {
+                                download_id: upload_id.clone(),
+                                ok: false,
+                                error: Some("size_exceeded".into()),
+                            };
+                            let _ = tx.send(WsMessage::Text(
+                                serde_json::to_string(&fail).unwrap(),
+                            ));
+                        }
+                        DownloadChunkDecision::Drop => {}
+                    }
                 } else if frame_type == protocol::PTY_OUTPUT {
                     state
                         .broker
@@ -1725,6 +1824,185 @@ mod tests {
             }
             _ => panic!("expected failure result"),
         }
+    }
+
+    // --- File download routing / role-gating ---
+
+    fn download_frame(payload: &[u8]) -> (String, Vec<u8>) {
+        let download_id = "d".repeat(36);
+        let frame =
+            protocol::build_binary_frame(protocol::PTY_FILE_DOWNLOAD_CHUNK, &download_id, payload);
+        (download_id, frame)
+    }
+
+    fn info_for(device_id: &str) -> ClientInfo {
+        ClientInfo {
+            device_id: device_id.into(),
+            device_name: "Device".into(),
+            ip: "1.2.3.4".into(),
+            connected_at: "now".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_client_download_request_registers_and_forwards() {
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx, None).await.unwrap();
+
+        let (ctx, _crx) = test_conn();
+        let mut role = client_role();
+        let req = ControlMessage::FileDownloadRequest {
+            download_id: "d1".into(),
+            session_id: "s1".into(),
+            path: "/home/sean/a.md".into(),
+        };
+        handle_control_message(&req, &mut role, &state, &ctx, "1.2.3.4").await;
+        // Forwarded verbatim to the desktop.
+        match drx.recv().await.unwrap() {
+            WsMessage::Text(t) => {
+                assert!(t.contains("file_download_request"));
+                assert!(t.contains("\"download_id\":\"d1\""));
+            }
+            _ => panic!("expected request forwarded to desktop"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_client_download_request_cap_rejection_replies_to_client_only() {
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx, None).await.unwrap();
+
+        let (ctx, mut crx) = test_conn();
+        let mut role = client_role();
+        // Fill the active-download cap (MAX_ACTIVE_DOWNLOADS = 4).
+        for i in 0..4 {
+            state
+                .broker
+                .register_download("alice", &format!("pre{i}"), &ctx)
+                .await
+                .unwrap();
+        }
+        let req = ControlMessage::FileDownloadRequest {
+            download_id: "d-extra".into(),
+            session_id: "s1".into(),
+            path: "/x".into(),
+        };
+        handle_control_message(&req, &mut role, &state, &ctx, "1.2.3.4").await;
+        // Over the cap: nothing reaches the desktop.
+        assert!(drx.try_recv().is_err());
+        // The requester gets a relay-originated failure end.
+        match crx.recv().await.unwrap() {
+            WsMessage::Text(t) => {
+                assert!(t.contains("file_download_end"));
+                assert!(t.contains("\"ok\":false"));
+                assert!(t.contains("too many active downloads"));
+            }
+            _ => panic!("expected failure end"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_desktop_download_begin_end_route_to_owner_only() {
+        let state = test_state();
+        let (dtx, _drx) = test_conn();
+        let (ctx, mut crx) = test_conn();
+        let (other, mut orx) = test_conn();
+        state.broker.register_client("alice", ctx.clone(), info_for("dev-1")).await.unwrap();
+        state.broker.register_client("alice", other.clone(), info_for("dev-2")).await.unwrap();
+        state.broker.register_download("alice", "d1", &ctx).await.unwrap();
+
+        let mut drole = desktop_role();
+        let begin = ControlMessage::FileDownloadBegin {
+            download_id: "d1".into(),
+            name: "a.md".into(),
+            size: 16,
+            mime: "text/markdown".into(),
+        };
+        handle_control_message(&begin, &mut drole, &state, &dtx, "1.2.3.4").await;
+        // Owner receives the begin; the other client does not.
+        match crx.recv().await.unwrap() {
+            WsMessage::Text(t) => assert!(t.contains("file_download_begin")),
+            _ => panic!("expected begin to owner"),
+        }
+        assert!(orx.try_recv().is_err(), "begin must not reach non-owner");
+
+        let end = ControlMessage::FileDownloadEnd {
+            download_id: "d1".into(),
+            ok: true,
+            error: None,
+        };
+        handle_control_message(&end, &mut drole, &state, &dtx, "1.2.3.4").await;
+        match crx.recv().await.unwrap() {
+            WsMessage::Text(t) => assert!(t.contains("file_download_end")),
+            _ => panic!("expected end to owner"),
+        }
+        assert!(orx.try_recv().is_err(), "end must not reach non-owner");
+    }
+
+    #[tokio::test]
+    async fn test_desktop_download_begin_unknown_id_dropped() {
+        let state = test_state();
+        let (dtx, _drx) = test_conn();
+        let mut drole = desktop_role();
+        let begin = ControlMessage::FileDownloadBegin {
+            download_id: "ghost".into(),
+            name: "a".into(),
+            size: 1,
+            mime: "application/octet-stream".into(),
+        };
+        // No panic, nothing to route — the unknown id is dropped with a warn.
+        handle_control_message(&begin, &mut drole, &state, &dtx, "1.2.3.4").await;
+    }
+
+    #[tokio::test]
+    async fn test_desktop_download_chunk_routes_to_owner() {
+        let state = test_state();
+        let (dtx, _drx) = test_conn();
+        let (ctx, mut crx) = test_conn();
+        let (id, frame) = download_frame(b"filedata");
+        state.broker.register_download("alice", &id, &ctx).await.unwrap();
+        state.broker.note_download_begin("alice", &id, 4096).await.unwrap();
+
+        handle_binary_message(&frame, &desktop_role(), &state, &dtx).await;
+        match crx.recv().await.unwrap() {
+            WsMessage::Binary(b) => assert_eq!(b, frame),
+            _ => panic!("expected chunk routed to owner"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_desktop_download_chunk_overrun_sends_failure_to_owner() {
+        let state = test_state();
+        let (dtx, _drx) = test_conn();
+        let (ctx, mut crx) = test_conn();
+        let (id, frame) = download_frame(b"way-too-long");
+        state.broker.register_download("alice", &id, &ctx).await.unwrap();
+        // Declared size smaller than the payload → overrun on first chunk.
+        state.broker.note_download_begin("alice", &id, 4).await.unwrap();
+
+        handle_binary_message(&frame, &desktop_role(), &state, &dtx).await;
+        // Owner gets a relay-originated failure end, not the chunk bytes.
+        match crx.recv().await.unwrap() {
+            WsMessage::Text(t) => {
+                assert!(t.contains("file_download_end"));
+                assert!(t.contains("size_exceeded"));
+            }
+            _ => panic!("expected failure end to owner"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_client_download_chunk_ignored() {
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        let (ctx, _crx) = test_conn();
+        let (_id, frame) = download_frame(b"data");
+        // A download chunk from a client role is not forwarded anywhere.
+        handle_binary_message(&frame, &client_role(), &state, &ctx).await;
+        assert!(drx.try_recv().is_err(), "client download chunk must not forward");
     }
 
     #[tokio::test]
