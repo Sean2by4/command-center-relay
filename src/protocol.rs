@@ -36,6 +36,33 @@ pub struct AccountMeta {
     pub status: String,
 }
 
+/// One plan rate-limit bucket for an account. Opaque to the relay — mirrored
+/// across transit (re-serialized losslessly) so PWA clients render usage bars.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageLimit {
+    pub kind: String,
+    pub percent: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_model: Option<String>,
+}
+
+/// Per-account plan-usage snapshot carried on `account_usage`. Opaque to the
+/// relay — mirrored across transit so PWA clients render the usage panel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUsage {
+    pub account_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub limits: Vec<UsageLimit>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub id: String,
@@ -195,6 +222,10 @@ pub enum ControlMessage {
         #[serde(rename = "maxTokens", default, skip_serializing_if = "Option::is_none")]
         max_tokens: Option<u64>,
     },
+    /// Per-account plan rate-limit usage (desktop → clients). Mirrored across
+    /// transit; the relay never inspects it.
+    #[serde(rename = "account_usage")]
+    AccountUsage { usage: Vec<AccountUsage> },
 
     // --- Web push ---
     #[serde(rename = "push_subscribe")]

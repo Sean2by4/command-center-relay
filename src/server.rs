@@ -928,6 +928,7 @@ async fn handle_control_message(
         ControlMessage::SessionCreated { .. }
         | ControlMessage::SessionClosed { .. }
         | ControlMessage::ContextUpdate { .. }
+        | ControlMessage::AccountUsage { .. }
         | ControlMessage::PtyResized { .. } => {
             if let ConnectionRole::Desktop { username } = role {
                 let json = serde_json::to_string(msg).unwrap();
