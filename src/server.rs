@@ -267,6 +267,10 @@ async fn ws_handler(
 /// State machine for a WebSocket connection after upgrade.
 enum ConnectionRole {
     Unauthenticated,
+    /// Parked after password/TOTP succeeded but the device still needs desktop
+    /// approval. Carries the account + minted device_id so a disconnect before
+    /// approval can garbage-collect the pending entry (ghost cleanup).
+    PendingApproval { username: String, device_id: String },
     Desktop { username: String },
     Client { username: String, device_id: String },
 }
@@ -410,6 +414,32 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, ip: String) {
                 Some(&ip),
                 None,
             );
+        }
+        ConnectionRole::PendingApproval { username, device_id } => {
+            // Ghost cleanup: the client parked for approval closed before the
+            // desktop acted. Drop its pending entry, roll back the provisional
+            // device row, and refresh the desktop's pending list so the stale
+            // approval card disappears.
+            if let Some(pending) =
+                state.broker.remove_pending_by_conn(username, &outbound_tx).await
+            {
+                let _ = device::revoke_device(state.auth.db(), &pending.device_id);
+                state.broker.push_pending_devices_list(username).await;
+                audit::log_audit(
+                    state.auth.db(),
+                    AuditEvent::DeviceRejected,
+                    Some(username),
+                    Some(device_id),
+                    Some(&ip),
+                    Some("pending client disconnected"),
+                );
+            }
+            // If approval already registered this connection as a client (before
+            // it re-authed to promote its role), free that registration too.
+            state
+                .broker
+                .unregister_client(username, device_id, &outbound_tx)
+                .await;
         }
         ConnectionRole::Unauthenticated => {}
     }
@@ -1099,6 +1129,9 @@ async fn handle_control_message(
                         Some(&pending.ip),
                         None,
                     );
+                    // Reconcile the desktop: the approved entry is gone from the
+                    // pending set, so push the fresh list to clear its card.
+                    state.broker.push_pending_devices_list(username).await;
                 }
             }
         }
@@ -1126,6 +1159,8 @@ async fn handle_control_message(
                         Some(&pending.ip),
                         None,
                     );
+                    // Reconcile the desktop: clear the rejected entry's card.
+                    state.broker.push_pending_devices_list(username).await;
                 }
             }
         }
@@ -1410,21 +1445,35 @@ async fn handle_auth(
         .await;
 
     // Add to pending list
+    let requested_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     state
         .broker
         .add_pending_device(
             username,
             PendingDevice {
-                device_id,
+                device_id: device_id.clone(),
                 device_name: device_name.to_string(),
                 ip: ip.to_string(),
                 client_tx: outbound_tx.clone(),
+                created: std::time::Instant::now(),
+                requested_at,
             },
         )
         .await;
+    // Reconcile the desktop with the new entry (also reaches desktops that
+    // missed the one-shot device_pending push, e.g. a reconnect race).
+    state.broker.push_pending_devices_list(username).await;
 
-    // Don't set role yet — wait for desktop approval
-    // The auth_result will be sent when the desktop approves/rejects
+    // Park the connection as PendingApproval — carrying the account + device_id
+    // so a disconnect before approval can garbage-collect this pending entry.
+    // The auth_result is sent when the desktop approves/rejects.
+    *role = ConnectionRole::PendingApproval {
+        username: username.to_string(),
+        device_id,
+    };
 }
 
 async fn handle_binary_message(
@@ -1537,7 +1586,9 @@ async fn handle_binary_message(
                     }
                 }
             }
-            ConnectionRole::Unauthenticated => {}
+            // Parked-for-approval and unauthenticated connections send no
+            // binary traffic; ignore any that arrives.
+            ConnectionRole::PendingApproval { .. } | ConnectionRole::Unauthenticated => {}
         },
         Err(e) => {
             tracing::warn!(error = %e, "invalid binary frame");
@@ -1668,6 +1719,53 @@ pub async fn run(
     let app = build_router(state.clone(), static_dir);
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
 
+    // Periodic sweep: expire pending device approvals older than the TTL so a
+    // never-approved request can't linger in relay memory or the desktop UI
+    // forever. Mirrors the lazy GC used for uploads/downloads/supervisor, but
+    // pending entries have no per-message trigger (the waiting client is idle),
+    // so the sweep runs on its own interval.
+    {
+        let gc_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            // Skip the immediate first tick (nothing is stale at startup).
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let expired = gc_state.broker.gc_pending_devices().await;
+                let mut changed: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for (username, pending) in expired {
+                    // Fail the waiting client (mirrors the reject path's
+                    // client_tx notification) and roll back its device row.
+                    let result = ControlMessage::AuthResult {
+                        success: false,
+                        token: None,
+                        device_id: None,
+                        error: Some("approval_timeout".into()),
+                        retry_after: None,
+                    };
+                    let _ = pending.client_tx.send(WsMessage::Text(
+                        serde_json::to_string(&result).unwrap(),
+                    ));
+                    let _ = device::revoke_device(gc_state.auth.db(), &pending.device_id);
+                    audit::log_audit(
+                        gc_state.auth.db(),
+                        AuditEvent::DeviceRejected,
+                        Some(&username),
+                        Some(&pending.device_id),
+                        Some(&pending.ip),
+                        Some("approval_timeout"),
+                    );
+                    changed.insert(username);
+                }
+                for username in changed {
+                    gc_state.broker.push_pending_devices_list(&username).await;
+                }
+            }
+        });
+    }
+
     tracing::info!("relay listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1749,6 +1847,18 @@ mod tests {
         )
     }
 
+    /// Drain the reconciliation frames the broker pushes to a freshly-registered
+    /// desktop (an empty `pending_devices_list`, plus any `connected_devices_list`),
+    /// so a test can assert on the message it actually exercises. Called right
+    /// after `register_desktop`, before the action under test enqueues anything.
+    fn drain_reconcile(rx: &mut mpsc::UnboundedReceiver<WsMessage>) {
+        while let Ok(WsMessage::Text(t)) = rx.try_recv() {
+            if !(t.contains("pending_devices_list") || t.contains("connected_devices_list")) {
+                break;
+            }
+        }
+    }
+
     fn client_role() -> ConnectionRole {
         ConnectionRole::Client {
             username: "alice".into(),
@@ -1767,6 +1877,7 @@ mod tests {
         let state = test_state();
         let (dtx, mut drx) = test_conn();
         state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        drain_reconcile(&mut drx);
 
         let (ctx, _crx) = test_conn();
         let (_id, frame) = upload_frame(b"data");
@@ -1779,6 +1890,7 @@ mod tests {
         let state = test_state();
         let (dtx, mut drx) = test_conn();
         state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        drain_reconcile(&mut drx);
 
         let (ctx, _crx) = test_conn();
         let (upload_id, frame) = upload_frame(b"filedata");
@@ -1796,6 +1908,7 @@ mod tests {
         let state = test_state();
         let (dtx, mut drx) = test_conn();
         state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        drain_reconcile(&mut drx);
 
         let (ctx, _crx) = test_conn();
         let (_id, frame) = upload_frame(b"x");
@@ -1808,6 +1921,7 @@ mod tests {
         let state = test_state();
         let (dtx, mut drx) = test_conn();
         state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        drain_reconcile(&mut drx);
 
         let (ctx, mut crx) = test_conn();
         let (upload_id, frame) = upload_frame(b"way-too-long");
@@ -1850,6 +1964,7 @@ mod tests {
         let state = test_state();
         let (dtx, mut drx) = test_conn();
         state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        drain_reconcile(&mut drx);
 
         let (ctx, _crx) = test_conn();
         let mut role = client_role();
@@ -1874,6 +1989,7 @@ mod tests {
         let state = test_state();
         let (dtx, mut drx) = test_conn();
         state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        drain_reconcile(&mut drx);
 
         let (ctx, mut crx) = test_conn();
         let mut role = client_role();
@@ -1999,6 +2115,7 @@ mod tests {
         let state = test_state();
         let (dtx, mut drx) = test_conn();
         state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        drain_reconcile(&mut drx);
         let (ctx, _crx) = test_conn();
         let (_id, frame) = download_frame(b"data");
         // A download chunk from a client role is not forwarded anywhere.
@@ -2011,6 +2128,7 @@ mod tests {
         let state = test_state();
         let (dtx, mut drx) = test_conn();
         state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        drain_reconcile(&mut drx);
 
         let (ctx, mut crx) = test_conn();
         let mut role = client_role();
@@ -2090,6 +2208,7 @@ mod tests {
 
         let (dtx, mut drx) = test_conn();
         state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        drain_reconcile(&mut drx);
 
         let (ctx, _crx) = test_conn();
         let mut role = client_role();
@@ -2137,6 +2256,7 @@ mod tests {
         let state = test_state();
         let (dtx, mut drx) = test_conn();
         state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        drain_reconcile(&mut drx);
 
         let (ctx, _crx) = test_conn();
         let mut role = client_role();
@@ -2397,6 +2517,7 @@ mod tests {
         let state = test_state();
         let (dtx, mut drx) = test_conn();
         state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        drain_reconcile(&mut drx);
 
         let (ctx, _crx) = test_conn();
         let mut role = client_role();
@@ -2545,6 +2666,7 @@ mod tests {
         let state = test_state();
         let (dtx, mut drx) = test_conn();
         state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        drain_reconcile(&mut drx);
 
         let (ctx, mut crx) = test_conn();
         let mut role = client_role();

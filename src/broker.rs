@@ -118,6 +118,11 @@ pub struct PendingDevice {
     pub device_name: String,
     pub ip: String,
     pub client_tx: ConnTx,
+    /// When this request was created (for the TTL sweep).
+    pub created: Instant,
+    /// Same instant as epoch-ms, sent to the desktop so it can render a stable
+    /// auto-reject countdown that survives list replacements.
+    pub requested_at: u64,
 }
 
 /// A queued replay request: the exact connection that asked for the session
@@ -290,6 +295,10 @@ const MAX_PENDING_SUPERVISOR: usize = 8;
 /// Supervisor entries older than this (created-based) are garbage-collected.
 /// 300s (not 60s): P3 chat tool-loops can exceed 60s.
 const SUPERVISOR_GC_SECS: u64 = 300;
+/// Pending device approvals older than this (created-based) are expired by the
+/// periodic sweep — the waiting client is failed and the desktop's pending list
+/// is refreshed, so a never-approved request can't linger in memory or UI.
+const PENDING_DEVICE_TTL_SECS: u64 = 600;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerError {
@@ -370,6 +379,10 @@ impl Broker {
         // Replay bookkeeping belongs to the previous desktop connection.
         state.replay_queue.clear();
         state.replay_target = None;
+        // Reconcile the freshly-(re)connected desktop's device UI with server
+        // truth: replay the current pending set (even when empty — an empty
+        // list clears stale local state) so approved/ghost entries disappear.
+        Self::send_pending_devices(state);
         // Notify all clients that desktop came online, advertising its features.
         let online_msg = WsMessage::Text(
             serde_json::to_string(&crate::protocol::ControlMessage::DesktopStatus {
@@ -452,6 +465,9 @@ impl Broker {
             existing.tx = tx.clone();
             existing.info = info;
             Self::replay_desktop_status(state, &tx);
+            // In-place re-register (re-auth after approval) can change the
+            // device name/ip — keep the desktop's connected list current.
+            Self::send_connected_devices(state);
             return Ok(());
         }
         if state.clients.len() >= MAX_CLIENTS {
@@ -465,6 +481,9 @@ impl Broker {
         // never hear its capabilities (DesktopStatus is only emitted on change),
         // leaving upload/bug-report UI hidden against a capable desktop.
         Self::replay_desktop_status(state, &tx);
+        // Push the updated connected-device roster to the desktop so its
+        // sidebar reflects the new device without a manual refresh.
+        Self::send_connected_devices(state);
         Ok(())
     }
 
@@ -501,6 +520,7 @@ impl Broker {
             // gone connection on purpose: the remaining frames of that burst
             // drop harmlessly instead of broadcasting to everyone, and the
             // trailing session_list clears the target.
+            Self::send_connected_devices(state);
         }
     }
 
@@ -511,6 +531,7 @@ impl Broker {
         if let Some(state) = accounts.get_mut(username) {
             state.clients.retain(|c| c.info.device_id != device_id);
             state.replay_queue.retain(|r| r.device_id != device_id);
+            Self::send_connected_devices(state);
         }
     }
 
@@ -1006,6 +1027,105 @@ impl Broker {
         Some(state.pending_devices.remove(idx))
     }
 
+    /// Remove a pending device by the CONNECTION that is waiting on it — the
+    /// ghost-cleanup path when an unapproved client's socket closes before the
+    /// desktop acts. Returns the removed entry (if any) so the caller can
+    /// refresh the desktop's pending list.
+    pub async fn remove_pending_by_conn(
+        &self,
+        username: &str,
+        conn: &ConnTx,
+    ) -> Option<PendingDevice> {
+        let mut accounts = self.accounts.write().await;
+        let state = accounts.get_mut(username)?;
+        let idx = state
+            .pending_devices
+            .iter()
+            .position(|p| p.client_tx.same_conn(conn))?;
+        Some(state.pending_devices.remove(idx))
+    }
+
+    /// Expire pending device approvals older than the TTL across every account.
+    /// Returns `(username, entry)` for each expired request so the caller can
+    /// fail the waiting client and refresh the affected desktops.
+    pub async fn gc_pending_devices(&self) -> Vec<(String, PendingDevice)> {
+        let mut accounts = self.accounts.write().await;
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        for (username, state) in accounts.iter_mut() {
+            let mut i = 0;
+            while i < state.pending_devices.len() {
+                if now.duration_since(state.pending_devices[i].created).as_secs()
+                    >= PENDING_DEVICE_TTL_SECS
+                {
+                    let p = state.pending_devices.remove(i);
+                    expired.push((username.clone(), p));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        expired
+    }
+
+    /// Push the current pending-device set to `username`'s desktop connection.
+    /// No-op when no desktop is registered. Safe to call after the pending set
+    /// changes (add/take/remove/expire) — it re-locks, so callers must not hold
+    /// the accounts lock.
+    pub async fn push_pending_devices_list(&self, username: &str) {
+        let accounts = self.accounts.read().await;
+        if let Some(state) = accounts.get(username) {
+            Self::send_pending_devices(state);
+        }
+    }
+
+    /// Serialize the account's pending devices and send them to its desktop.
+    /// Sent even when empty — an empty list is what clears stale desktop UI.
+    /// Assumes the caller holds the accounts lock (no re-lock).
+    fn send_pending_devices(state: &AccountState) {
+        let Some(desktop) = state.desktop_tx.as_ref() else {
+            return;
+        };
+        let devices: Vec<_> = state
+            .pending_devices
+            .iter()
+            .map(|p| crate::protocol::PendingDeviceInfo {
+                device_id: p.device_id.clone(),
+                device_name: p.device_name.clone(),
+                ip: p.ip.clone(),
+                requested_at: Some(p.requested_at),
+            })
+            .collect();
+        let msg = crate::protocol::ControlMessage::PendingDevicesList { devices };
+        let _ = desktop.send(WsMessage::Text(
+            serde_json::to_string(&msg).unwrap_or_default(),
+        ));
+    }
+
+    /// Serialize the account's connected devices (deduped by device_id) and send
+    /// them to its desktop. Assumes the caller holds the accounts lock.
+    fn send_connected_devices(state: &AccountState) {
+        let Some(desktop) = state.desktop_tx.as_ref() else {
+            return;
+        };
+        let mut seen = std::collections::HashSet::new();
+        let devices: Vec<_> = state
+            .clients
+            .iter()
+            .filter(|c| seen.insert(c.info.device_id.clone()))
+            .map(|c| crate::protocol::DeviceInfo {
+                id: c.info.device_id.clone(),
+                name: c.info.device_name.clone(),
+                ip: c.info.ip.clone(),
+                connected_at: c.info.connected_at.clone(),
+            })
+            .collect();
+        let msg = crate::protocol::ControlMessage::ConnectedDevicesList { devices };
+        let _ = desktop.send(WsMessage::Text(
+            serde_json::to_string(&msg).unwrap_or_default(),
+        ));
+    }
+
     /// Get info about all connected clients for an account, deduped by
     /// device_id (two tabs on one device are still one device to the user).
     pub async fn get_connected_clients(&self, username: &str) -> Vec<ClientInfo> {
@@ -1183,6 +1303,8 @@ mod tests {
         let broker = Broker::new();
         let (tx, mut rx) = test_conn();
         broker.register_desktop("alice", tx, None).await.unwrap();
+        // Drain the register-time pending_devices_list snapshot (empty).
+        assert!(rx.try_recv().is_ok());
 
         broker
             .send_to_desktop("alice", WsMessage::Text("hello".into()))
@@ -1276,6 +1398,8 @@ mod tests {
             device_name: "New Phone".into(),
             ip: "1.2.3.4".into(),
             client_tx: tx,
+            created: Instant::now(),
+            requested_at: 0,
         };
         broker.add_pending_device("alice", pending).await;
 
@@ -1285,6 +1409,113 @@ mod tests {
 
         // Second take should return None
         assert!(broker.take_pending_device("alice", "pending-1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_pending_by_conn() {
+        let broker = Broker::new();
+        let (tx, _rx) = test_conn();
+        let (other, _orx) = test_conn();
+        broker
+            .add_pending_device(
+                "alice",
+                PendingDevice {
+                    device_id: "pending-1".into(),
+                    device_name: "New Phone".into(),
+                    ip: "1.2.3.4".into(),
+                    client_tx: tx.clone(),
+                    created: Instant::now(),
+                    requested_at: 0,
+                },
+            )
+            .await;
+
+        // A different connection removes nothing.
+        assert!(broker.remove_pending_by_conn("alice", &other).await.is_none());
+        // The owning connection removes its own entry.
+        let removed = broker.remove_pending_by_conn("alice", &tx).await;
+        assert_eq!(removed.unwrap().device_id, "pending-1");
+        assert!(broker.remove_pending_by_conn("alice", &tx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_gc_pending_devices_expires_old_entries() {
+        let broker = Broker::new();
+        let (fresh_tx, _f) = test_conn();
+        let (old_tx, _o) = test_conn();
+        // A fresh entry (created now) must survive.
+        broker
+            .add_pending_device(
+                "alice",
+                PendingDevice {
+                    device_id: "fresh".into(),
+                    device_name: "Fresh".into(),
+                    ip: "1.1.1.1".into(),
+                    client_tx: fresh_tx,
+                    created: Instant::now(),
+                    requested_at: 0,
+                },
+            )
+            .await;
+        // An entry created well past the TTL must be expired.
+        broker
+            .add_pending_device(
+                "alice",
+                PendingDevice {
+                    device_id: "stale".into(),
+                    device_name: "Stale".into(),
+                    ip: "2.2.2.2".into(),
+                    client_tx: old_tx,
+                    created: Instant::now()
+                        - std::time::Duration::from_secs(PENDING_DEVICE_TTL_SECS + 1),
+                    requested_at: 0,
+                },
+            )
+            .await;
+
+        let expired = broker.gc_pending_devices().await;
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, "alice");
+        assert_eq!(expired[0].1.device_id, "stale");
+        // The fresh one is still pending; the stale one is gone.
+        assert!(broker.take_pending_device("alice", "fresh").await.is_some());
+        assert!(broker.take_pending_device("alice", "stale").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pending_devices_list_pushed_to_desktop() {
+        let broker = Broker::new();
+        let (dtx, mut drx) = test_conn();
+        broker.register_desktop("alice", dtx, None).await.unwrap();
+        // Draining the register-time snapshot (empty pending list).
+        assert!(drx.try_recv().is_ok());
+
+        let (ctx, _crx) = test_conn();
+        broker
+            .add_pending_device(
+                "alice",
+                PendingDevice {
+                    device_id: "pending-1".into(),
+                    device_name: "New Phone".into(),
+                    ip: "1.2.3.4".into(),
+                    client_tx: ctx,
+                    created: Instant::now(),
+                    requested_at: 42,
+                },
+            )
+            .await;
+        broker.push_pending_devices_list("alice").await;
+
+        // The desktop received a pending_devices_list carrying the entry.
+        let mut saw_list = false;
+        while let Ok(msg) = drx.try_recv() {
+            if let WsMessage::Text(t) = msg {
+                if t.contains("pending_devices_list") && t.contains("pending-1") {
+                    saw_list = true;
+                }
+            }
+        }
+        assert!(saw_list, "desktop must receive pending_devices_list");
     }
 
     #[tokio::test]

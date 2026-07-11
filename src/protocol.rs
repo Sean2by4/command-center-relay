@@ -72,6 +72,20 @@ pub struct DeviceInfo {
     pub connected_at: String,
 }
 
+/// One entry in a `pending_devices_list` (relay → desktop). Mirrors the field
+/// conventions of the `device_pending` control message plus a `requestedAt`
+/// epoch-ms timestamp so the desktop can render a stable auto-reject countdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingDeviceInfo {
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
+    #[serde(rename = "deviceName")]
+    pub device_name: String,
+    pub ip: String,
+    #[serde(rename = "requestedAt", default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<u64>,
+}
+
 /// All JSON control messages on the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -379,6 +393,13 @@ pub enum ControlMessage {
     ConnectedDevicesRequest,
     #[serde(rename = "connected_devices_list")]
     ConnectedDevicesList { devices: Vec<DeviceInfo> },
+    /// Relay → desktop: the full current set of devices awaiting approval.
+    /// Pushed whenever the pending set changes and on desktop (re)connect
+    /// (even when empty — an empty list clears stale desktop UI state). This is
+    /// the server-truth reconciliation the desktop replaces its local pending
+    /// list with, so approved/expired/ghost entries disappear.
+    #[serde(rename = "pending_devices_list")]
+    PendingDevicesList { devices: Vec<PendingDeviceInfo> },
     #[serde(rename = "device_revoke")]
     DeviceRevoke {
         #[serde(rename = "deviceId")]
@@ -937,6 +958,47 @@ mod tests {
                 assert_eq!(message, "desktop offline");
             }
             _ => panic!("expected SupervisorError"),
+        }
+    }
+
+    #[test]
+    fn test_pending_devices_list_roundtrips() {
+        let msg = ControlMessage::PendingDevicesList {
+            devices: vec![PendingDeviceInfo {
+                device_id: "dev-1".into(),
+                device_name: "Pending device".into(),
+                ip: "1.2.3.4".into(),
+                requested_at: Some(1_719_700_000_000),
+            }],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"pending_devices_list\""));
+        assert!(json.contains("\"deviceId\":\"dev-1\""));
+        assert!(json.contains("\"requestedAt\":1719700000000"));
+        let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ControlMessage::PendingDevicesList { devices } => {
+                assert_eq!(devices.len(), 1);
+                assert_eq!(devices[0].device_id, "dev-1");
+                assert_eq!(devices[0].requested_at, Some(1_719_700_000_000));
+            }
+            _ => panic!("expected PendingDevicesList"),
+        }
+    }
+
+    #[test]
+    fn test_pending_devices_list_empty_and_no_timestamp() {
+        // Empty list serializes (clears desktop UI) and requestedAt is optional.
+        let empty = ControlMessage::PendingDevicesList { devices: vec![] };
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(json.contains("\"devices\":[]"));
+        let no_ts = r#"{"type":"pending_devices_list","devices":[{"deviceId":"d","deviceName":"n","ip":"1.1.1.1"}]}"#;
+        let parsed: ControlMessage = serde_json::from_str(no_ts).unwrap();
+        match parsed {
+            ControlMessage::PendingDevicesList { devices } => {
+                assert!(devices[0].requested_at.is_none());
+            }
+            _ => panic!("expected PendingDevicesList"),
         }
     }
 
