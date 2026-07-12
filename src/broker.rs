@@ -379,11 +379,17 @@ impl Broker {
         // Replay bookkeeping belongs to the previous desktop connection.
         state.replay_queue.clear();
         state.replay_target = None;
-        // Reconcile the freshly-(re)connected desktop's device UI with server
-        // truth: replay the current pending set (even when empty — an empty
-        // list clears stale local state) so approved/ghost entries disappear.
-        Self::send_pending_devices(state);
+        // NOTE: the pending-device reconciliation snapshot is deliberately NOT
+        // sent here. The desktop handshake is strict — the very next text frame
+        // after `desktop_register` must be `desktop_registered`, or the client
+        // aborts. Queuing a `pending_devices_list` before the ack caused a
+        // reconnect storm. The caller (server.rs) sends the ack FIRST, then
+        // calls `push_pending_devices_list` to replay the pending set (even when
+        // empty — an empty list clears stale local state).
         // Notify all clients that desktop came online, advertising its features.
+        // The desktop being registered is NOT in `state.clients` (a desktop-key
+        // connection never calls register_client), so this loop cannot enqueue
+        // to the registering desktop's own outbound_tx and race the ack.
         let online_msg = WsMessage::Text(
             serde_json::to_string(&crate::protocol::ControlMessage::DesktopStatus {
                 online: true,
@@ -1303,8 +1309,9 @@ mod tests {
         let broker = Broker::new();
         let (tx, mut rx) = test_conn();
         broker.register_desktop("alice", tx, None).await.unwrap();
-        // Drain the register-time pending_devices_list snapshot (empty).
-        assert!(rx.try_recv().is_ok());
+        // register_desktop no longer queues any frame — the pending snapshot is
+        // pushed by the server AFTER the desktop_registered ack.
+        assert!(rx.try_recv().is_err());
 
         broker
             .send_to_desktop("alice", WsMessage::Text("hello".into()))
@@ -1487,8 +1494,8 @@ mod tests {
         let broker = Broker::new();
         let (dtx, mut drx) = test_conn();
         broker.register_desktop("alice", dtx, None).await.unwrap();
-        // Draining the register-time snapshot (empty pending list).
-        assert!(drx.try_recv().is_ok());
+        // register_desktop no longer queues a snapshot; nothing to drain.
+        assert!(drx.try_recv().is_err());
 
         let (ctx, _crx) = test_conn();
         broker

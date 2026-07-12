@@ -576,6 +576,11 @@ async fn handle_control_message(
                             .send(WsMessage::Text(
                                 serde_json::to_string(&ControlMessage::DesktopRegistered).unwrap(),
                             ));
+                        // Reconcile the desktop's device UI AFTER the ack: the
+                        // strict handshake requires `desktop_registered` to be
+                        // the first frame, so the pending snapshot (pushed even
+                        // when empty, to clear stale local state) must follow it.
+                        state.broker.push_pending_devices_list(&username).await;
                         audit::log_audit(
                             state.auth.db(),
                             AuditEvent::DesktopConnected,
@@ -1981,6 +1986,63 @@ mod tests {
                 assert!(t.contains("\"download_id\":\"d1\""));
             }
             _ => panic!("expected request forwarded to desktop"),
+        }
+    }
+
+    // Regression: the desktop handshake is strict — after `desktop_register`
+    // the very NEXT text frame must be `desktop_registered`, or the client
+    // aborts and reconnects in a loop. Queuing the pending-device snapshot
+    // before the ack (the old bug) caused a production reconnect storm.
+    #[tokio::test]
+    async fn test_desktop_register_acks_before_pending_snapshot() {
+        let state = test_state();
+        // A pending device exists so the snapshot is non-empty and unmistakable.
+        state
+            .broker
+            .add_pending_device(
+                "alice",
+                PendingDevice {
+                    device_id: "pending-1".into(),
+                    device_name: "New Phone".into(),
+                    ip: "1.2.3.4".into(),
+                    client_tx: {
+                        let (c, _r) = test_conn();
+                        c
+                    },
+                    created: std::time::Instant::now(),
+                    requested_at: 42,
+                },
+            )
+            .await;
+
+        // The registering connection is authenticated as a Client (a desktop-key
+        // connection sets the Client role, then upgrades via desktop_register).
+        let (dtx, mut drx) = test_conn();
+        let mut role = ConnectionRole::Client {
+            username: "alice".into(),
+            device_id: "desktop".into(),
+        };
+        let req = ControlMessage::DesktopRegister {
+            version: 1,
+            capabilities: None,
+        };
+        handle_control_message(&req, &mut role, &state, &dtx, "1.2.3.4").await;
+
+        // First frame MUST be desktop_registered.
+        match drx.try_recv().expect("expected an ack frame") {
+            WsMessage::Text(t) => assert!(
+                t.contains("desktop_registered"),
+                "first frame must be desktop_registered, got: {t}"
+            ),
+            other => panic!("expected text ack, got {other:?}"),
+        }
+        // The pending snapshot follows AFTER the ack.
+        match drx.try_recv().expect("expected a pending snapshot frame") {
+            WsMessage::Text(t) => {
+                assert!(t.contains("pending_devices_list"), "got: {t}");
+                assert!(t.contains("pending-1"), "snapshot must carry the entry: {t}");
+            }
+            other => panic!("expected pending snapshot text, got {other:?}"),
         }
     }
 
