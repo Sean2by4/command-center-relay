@@ -61,7 +61,7 @@ pub struct AuthManager {
 
 const MAX_FAILURES: u32 = 5;
 const LOCKOUT_DURATION: Duration = Duration::from_secs(900); // 15 min
-const JWT_EXPIRY: Duration = Duration::from_secs(86400); // 24 hours
+const JWT_EXPIRY: Duration = Duration::from_secs(30 * 86400); // 30 days, sliding — reissued on every reconnect
 
 impl AuthManager {
     pub fn new(db: Database) -> Result<Self, AuthError> {

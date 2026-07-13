@@ -118,7 +118,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 }
 
 /// Validate a `Authorization: Bearer <jwt>` header and return the authenticated
-/// username (JWT `sub`). The JWT is the same 24h token a phone/desktop client
+/// username (JWT `sub`). The JWT is the same 30-day token a phone/desktop client
 /// receives in its AuthResult and re-presents as `device_token` on the WS path;
 /// we reuse the exact same validation. Any failure maps to 401.
 fn authenticate_bearer(state: &AppState, headers: &HeaderMap) -> Result<String, StatusCode> {
@@ -132,7 +132,7 @@ fn authenticate_bearer(state: &AppState, headers: &HeaderMap) -> Result<String, 
         .validate_jwt(token)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
     // Mirror the WS reconnect path: a valid JWT from a revoked (deleted)
-    // device must not keep working for the rest of its 24h lifetime.
+    // device must not keep working for the rest of its 30-day lifetime.
     if !device::is_device_registered(state.auth.db(), &claims.device_id, &claims.sub) {
         return Err(StatusCode::UNAUTHORIZED);
     }
