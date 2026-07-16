@@ -25,6 +25,10 @@ pub struct SessionInfo {
     pub created_at: Option<u64>,
     #[serde(rename = "accountId", default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+    /// Which CLI the session launched ("claude"/"codex"). Opaque to the relay;
+    /// absent = plain terminal or an old desktop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// Account roster entry carried on `session_list`. Opaque to the relay —
@@ -34,6 +38,10 @@ pub struct AccountMeta {
     pub id: String,
     pub color: String,
     pub status: String,
+    /// Account provider ("codex"); omitted by desktops for claude accounts.
+    /// Opaque to the relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// One plan rate-limit bucket for an account. Opaque to the relay — mirrored
@@ -193,6 +201,10 @@ pub enum ControlMessage {
         rows: Option<u16>,
         #[serde(rename = "accountId", default, skip_serializing_if = "Option::is_none")]
         account_id: Option<String>,
+        /// Which CLI the session launched ("claude"/"codex"). Opaque to the
+        /// relay; absent = plain terminal or an old desktop.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     #[serde(rename = "session_renamed")]
     SessionRenamed {
@@ -563,6 +575,7 @@ mod tests {
                 rows: 40,
                 created_at: Some(1719700000000),
                 account_id: None,
+                kind: None,
             }],
             accounts: None,
         };
@@ -676,6 +689,40 @@ mod tests {
         let reser: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
+    }
+
+    #[test]
+    fn test_session_kind_and_roster_provider_roundtrip() {
+        // New desktop: per-session kind + roster provider (codex only; claude
+        // entries omit it). Both survive transit and re-serialize identically.
+        let json = r##"{"type":"session_list","sessions":[{"id":"a","label":"L1","cwd":"/","cols":80,"rows":24,"accountId":"codex","kind":"codex"},{"id":"b","label":"L2","cwd":"/","cols":80,"rows":24,"accountId":"primary","kind":"claude"}],"accounts":[{"id":"primary","color":"#7aa2f7","status":"ok"},{"id":"codex","color":"#73daca","status":"ok","provider":"codex"}]}"##;
+        let parsed: ControlMessage = serde_json::from_str(json).unwrap();
+        match &parsed {
+            ControlMessage::SessionList { sessions, accounts } => {
+                assert_eq!(sessions[0].kind.as_deref(), Some("codex"));
+                assert_eq!(sessions[1].kind.as_deref(), Some("claude"));
+                let roster = accounts.as_ref().expect("accounts present");
+                assert_eq!(roster[0].provider, None);
+                assert_eq!(roster[1].provider.as_deref(), Some("codex"));
+            }
+            _ => panic!("expected SessionList"),
+        }
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
+
+        // session_created with kind round-trips too.
+        let created = r#"{"type":"session_created","sessionId":"s1","label":"L","cols":80,"rows":24,"accountId":"codex","kind":"codex"}"#;
+        let parsed: ControlMessage = serde_json::from_str(created).unwrap();
+        match &parsed {
+            ControlMessage::SessionCreated { kind, .. } => {
+                assert_eq!(kind.as_deref(), Some("codex"));
+            }
+            _ => panic!("expected SessionCreated"),
+        }
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(created).unwrap());
     }
 
     #[test]
