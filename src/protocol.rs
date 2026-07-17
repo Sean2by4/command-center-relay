@@ -726,6 +726,45 @@ mod tests {
     }
 
     #[test]
+    fn test_kimi_kind_and_roster_provider_roundtrip() {
+        // A new provider ("kimi") is an opaque string to the relay: no enum
+        // change needed. It must survive transit alongside codex/claude, and
+        // claude entries must still omit both kind-less roster provider and be
+        // byte-identical on re-serialization.
+        let json = r##"{"type":"session_list","sessions":[{"id":"a","label":"L1","cwd":"/","cols":80,"rows":24,"accountId":"codex","kind":"codex"},{"id":"b","label":"L2","cwd":"/","cols":80,"rows":24,"accountId":"kimi","kind":"kimi"},{"id":"c","label":"L3","cwd":"/","cols":80,"rows":24,"accountId":"primary","kind":"claude"}],"accounts":[{"id":"primary","color":"#7aa2f7","status":"ok"},{"id":"codex","color":"#73daca","status":"ok","provider":"codex"},{"id":"kimi","color":"#e0af68","status":"ok","provider":"kimi"}]}"##;
+        let parsed: ControlMessage = serde_json::from_str(json).unwrap();
+        match &parsed {
+            ControlMessage::SessionList { sessions, accounts } => {
+                assert_eq!(sessions[0].kind.as_deref(), Some("codex"));
+                assert_eq!(sessions[1].kind.as_deref(), Some("kimi"));
+                assert_eq!(sessions[2].kind.as_deref(), Some("claude"));
+                let roster = accounts.as_ref().expect("accounts present");
+                // claude entry omits provider entirely.
+                assert_eq!(roster[0].provider, None);
+                assert_eq!(roster[1].provider.as_deref(), Some("codex"));
+                assert_eq!(roster[2].provider.as_deref(), Some("kimi"));
+            }
+            _ => panic!("expected SessionList"),
+        }
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
+
+        // session_created with kind "kimi" round-trips too.
+        let created = r#"{"type":"session_created","sessionId":"s1","label":"L","cols":80,"rows":24,"accountId":"kimi","kind":"kimi"}"#;
+        let parsed: ControlMessage = serde_json::from_str(created).unwrap();
+        match &parsed {
+            ControlMessage::SessionCreated { kind, .. } => {
+                assert_eq!(kind.as_deref(), Some("kimi"));
+            }
+            _ => panic!("expected SessionCreated"),
+        }
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(created).unwrap());
+    }
+
+    #[test]
     fn test_file_chunk_frame_roundtrips() {
         let upload_id = uuid::Uuid::new_v4().to_string();
         let payload = b"file bytes";
