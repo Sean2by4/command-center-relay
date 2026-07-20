@@ -44,32 +44,13 @@ pub struct AccountMeta {
     pub provider: Option<String>,
 }
 
-/// One plan rate-limit bucket for an account. Opaque to the relay — mirrored
-/// across transit (re-serialized losslessly) so PWA clients render usage bars.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageLimit {
-    pub kind: String,
-    pub percent: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resets_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub severity: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope_model: Option<String>,
-}
-
-/// Per-account plan-usage snapshot carried on `account_usage`. Opaque to the
-/// relay — mirrored across transit so PWA clients render the usage panel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AccountUsage {
-    pub account_id: String,
-    pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    pub limits: Vec<UsageLimit>,
-}
+/// Per-account plan-usage snapshot carried on `account_usage`. TRULY opaque to
+/// the relay: raw JSON, so desktop-side field additions (`stale`, `fetchedAt`,
+/// future limit buckets) survive the deserialize→re-serialize forwarding hop.
+/// The previous typed struct silently stripped unknown fields in transit —
+/// the PWA rendered "token expired" instead of an expired account's cached
+/// bars because `stale`/`fetchedAt` never arrived.
+pub type AccountUsage = serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -723,6 +704,28 @@ mod tests {
         let reser: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(reser, serde_json::from_str::<serde_json::Value>(created).unwrap());
+    }
+
+    #[test]
+    fn test_account_usage_forwards_unknown_fields() {
+        // account_usage rows are opaque JSON: every field the desktop sends —
+        // including ones this relay build has never heard of (`stale`,
+        // `fetchedAt`, future buckets) — must survive the deserialize→
+        // re-serialize forwarding hop byte-for-byte. The old typed struct
+        // stripped them, which broke the PWA's stale-bars rendering.
+        let json = r##"{"type":"account_usage","usage":[{"accountId":"3","status":"staleToken","stale":true,"fetchedAt":1752999722000,"limits":[{"kind":"session","percent":42.5,"resetsAt":"2026-07-21T00:00:00Z","futureField":"x"}]}]}"##;
+        let parsed: ControlMessage = serde_json::from_str(json).unwrap();
+        match &parsed {
+            ControlMessage::AccountUsage { usage } => {
+                assert_eq!(usage.len(), 1);
+                assert_eq!(usage[0]["stale"], serde_json::json!(true));
+                assert_eq!(usage[0]["fetchedAt"], serde_json::json!(1752999722000u64));
+            }
+            _ => panic!("expected AccountUsage"),
+        }
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
     }
 
     #[test]
