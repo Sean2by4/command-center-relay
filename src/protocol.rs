@@ -160,6 +160,16 @@ pub enum ControlMessage {
     },
     #[serde(rename = "session_list_request")]
     SessionListRequest,
+    /// Client → relay only (never forwarded): the session(s) this client is
+    /// actively viewing. The broker relays live PTY output only for focused
+    /// sessions; a client that never sends this (or sends an empty list)
+    /// receives every session's output — the pre-focus behavior, so old
+    /// clients are unaffected.
+    #[serde(rename = "session_focus")]
+    SessionFocus {
+        #[serde(rename = "sessionIds")]
+        session_ids: Vec<String>,
+    },
     #[serde(rename = "session_list")]
     SessionList {
         sessions: Vec<SessionInfo>,

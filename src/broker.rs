@@ -1,6 +1,6 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
 
@@ -26,6 +26,18 @@ impl WsMessage {
     fn is_pty_output(&self) -> bool {
         matches!(self, WsMessage::Binary(b) if b.first() == Some(&PTY_OUTPUT))
     }
+
+    /// Session id slot of a PTY_OUTPUT frame: bytes 1..37, space-padded
+    /// (mirrors the desktop's `build_binary_frame`). None for non-output
+    /// frames or malformed headers.
+    fn pty_output_session(&self) -> Option<&str> {
+        match self {
+            WsMessage::Binary(b) if b.first() == Some(&PTY_OUTPUT) && b.len() >= 37 => {
+                std::str::from_utf8(&b[1..37]).ok().map(str::trim)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Outbound handle for one connection. Messages flow through an unbounded
@@ -43,6 +55,12 @@ pub struct ConnTx {
     queued: Arc<AtomicUsize>,
     dirty: Arc<AtomicBool>,
     last_resync: Arc<TokioMutex<Option<Instant>>>,
+    /// Sessions this client is actively viewing (`session_focus` message).
+    /// None = the client never scoped itself (old clients) — it receives every
+    /// session's live output, the pre-focus behavior. A phone viewing one
+    /// session out of six otherwise gets the full firehose, blows the output
+    /// budget in minutes, and lives inside the pause→resync cycle.
+    focus: Arc<StdRwLock<Option<HashSet<String>>>>,
 }
 
 /// Live output queued beyond this marks the connection dirty. The scrollback
@@ -60,6 +78,26 @@ impl ConnTx {
             queued,
             dirty: Arc::new(AtomicBool::new(false)),
             last_resync: Arc::new(TokioMutex::new(None)),
+            focus: Arc::new(StdRwLock::new(None)),
+        }
+    }
+
+    /// Update the focused-session set. An empty list clears scoping (receive
+    /// everything) — the safe reading of "nothing focused".
+    pub fn set_focus(&self, ids: Vec<String>) {
+        let new = if ids.is_empty() {
+            None
+        } else {
+            Some(ids.into_iter().collect())
+        };
+        *self.focus.write().unwrap() = new;
+    }
+
+    /// Whether live output for `session_id` should reach this connection.
+    fn wants_session(&self, session_id: &str) -> bool {
+        match &*self.focus.read().unwrap() {
+            None => true,
+            Some(set) => set.contains(session_id),
         }
     }
 
@@ -949,7 +987,15 @@ impl Broker {
             return;
         }
 
+        // Focus scoping: skipped frames are never queued, so they don't count
+        // toward the client's budget or trip the dirty/resync cycle.
+        let session_id = msg.pty_output_session().map(str::to_owned);
         for client in &state.clients {
+            if let Some(sid) = session_id.as_deref() {
+                if !client.tx.wants_session(sid) {
+                    continue;
+                }
+            }
             if client.tx.send_output(msg.clone()) {
                 tracing::warn!(
                     username = %username,
@@ -1223,6 +1269,58 @@ mod tests {
         assert!(broker.end_replay("alice").await.unwrap().same_conn(&txs[0]));
         broker.begin_replay("alice").await;
         assert!(broker.end_replay("alice").await.unwrap().same_conn(&txs[1]));
+    }
+
+    /// Build a PTY_OUTPUT frame with the desktop's header layout (type byte +
+    /// 36-byte space-padded session id + payload).
+    fn output_frame(session_id: &str, payload: &[u8]) -> WsMessage {
+        let mut buf = vec![PTY_OUTPUT];
+        let mut padded = [b' '; 36];
+        let id = session_id.as_bytes();
+        padded[..id.len().min(36)].copy_from_slice(&id[..id.len().min(36)]);
+        buf.extend_from_slice(&padded);
+        buf.extend_from_slice(payload);
+        WsMessage::Binary(buf)
+    }
+
+    #[tokio::test]
+    async fn test_focus_scopes_live_output() {
+        let broker = Broker::new();
+        let (dtx, _drx) = test_conn();
+        broker.register_desktop("alice", dtx, None).await.unwrap();
+
+        let (focused, mut focused_rx) = test_conn();
+        let (unscoped, mut unscoped_rx) = test_conn();
+        for (dev, tx) in [("dev-f", &focused), ("dev-u", &unscoped)] {
+            let info = ClientInfo {
+                device_id: dev.into(),
+                device_name: dev.into(),
+                ip: "1.2.3.4".into(),
+                connected_at: "now".into(),
+            };
+            broker.register_client("alice", tx.clone(), info).await.unwrap();
+        }
+        focused.set_focus(vec!["sess-a".into()]);
+
+        // Drain the roster/device broadcasts registration pushed to both
+        // clients so the assertions below see only PTY output frames.
+        while focused_rx.try_recv().is_ok() {}
+        while unscoped_rx.try_recv().is_ok() {}
+
+        // Output for an unfocused session: only the unscoped client gets it.
+        broker.broadcast_to_clients("alice", output_frame("sess-b", b"x")).await;
+        assert!(focused_rx.try_recv().is_err());
+        assert!(unscoped_rx.try_recv().is_ok());
+
+        // Output for the focused session: both get it.
+        broker.broadcast_to_clients("alice", output_frame("sess-a", b"y")).await;
+        assert!(focused_rx.try_recv().is_ok());
+        assert!(unscoped_rx.try_recv().is_ok());
+
+        // Empty focus clears scoping.
+        focused.set_focus(Vec::new());
+        broker.broadcast_to_clients("alice", output_frame("sess-b", b"z")).await;
+        assert!(focused_rx.try_recv().is_ok());
     }
 
     #[tokio::test]

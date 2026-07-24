@@ -848,6 +848,14 @@ async fn handle_control_message(
             }
         }
 
+        // Client → relay only: scope live PTY output to the session(s) this
+        // client is viewing. Never forwarded to the desktop.
+        ControlMessage::SessionFocus { session_ids } => {
+            if matches!(role, ConnectionRole::Client { .. }) {
+                outbound_tx.set_focus(session_ids.clone());
+            }
+        }
+
         // List requests are queued so the desktop's reply burst (replay_begin
         // + scrollback + session_list) can be routed back to the requester
         // only, instead of resetting every connected client's terminal.
