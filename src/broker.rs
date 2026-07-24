@@ -82,15 +82,16 @@ impl ConnTx {
         }
     }
 
-    /// Update the focused-session set. An empty list clears scoping (receive
-    /// everything) — the safe reading of "nothing focused".
+    /// Update the focused-session set. An empty list means "viewing nothing"
+    /// (e.g. the PWA session-list screen) — no live output wanted. Only a
+    /// client that NEVER sends session_focus (old bundles) stays unscoped.
     pub fn set_focus(&self, ids: Vec<String>) {
-        let new = if ids.is_empty() {
-            None
-        } else {
-            Some(ids.into_iter().collect())
-        };
-        *self.focus.write().unwrap() = new;
+        *self.focus.write().unwrap() = Some(ids.into_iter().collect());
+    }
+
+    /// Snapshot of the focus set; None = never scoped (old client).
+    fn focus_snapshot(&self) -> Option<HashSet<String>> {
+        self.focus.read().unwrap().clone()
     }
 
     /// Whether live output for `session_id` should reach this connection.
@@ -512,6 +513,9 @@ impl Broker {
             // In-place re-register (re-auth after approval) can change the
             // device name/ip — keep the desktop's connected list current.
             Self::send_connected_devices(state);
+            // The fresh ConnTx starts unscoped — widen the desktop's focus
+            // union until this client re-sends session_focus.
+            Self::push_focus_to_desktop(state);
             return Ok(());
         }
         if state.clients.len() >= MAX_CLIENTS {
@@ -528,6 +532,9 @@ impl Broker {
         // Push the updated connected-device roster to the desktop so its
         // sidebar reflects the new device without a manual refresh.
         Self::send_connected_devices(state);
+        // New client = unscoped until its first session_focus — widen the
+        // desktop's focus union accordingly (old bundles never narrow it).
+        Self::push_focus_to_desktop(state);
         Ok(())
     }
 
@@ -565,6 +572,9 @@ impl Broker {
             // drop harmlessly instead of broadcasting to everyone, and the
             // trailing session_list clears the target.
             Self::send_connected_devices(state);
+            // Departed client may have been the widest scope — narrow the
+            // desktop's focus union (zero clients = send nothing upstream).
+            Self::push_focus_to_desktop(state);
         }
     }
 
@@ -576,6 +586,7 @@ impl Broker {
             state.clients.retain(|c| c.info.device_id != device_id);
             state.replay_queue.retain(|r| r.device_id != device_id);
             Self::send_connected_devices(state);
+            Self::push_focus_to_desktop(state);
         }
     }
 
@@ -1007,6 +1018,45 @@ impl Broker {
         }
     }
 
+    /// Compute the union of every client's focus and push it to the desktop
+    /// as a `session_focus` message, so the helper stops sending unviewed
+    /// sessions' live output across the WAN at all (the desktop uplink was
+    /// the remaining lag leg: keystroke echo queued behind every session's
+    /// output). Any unscoped client (old bundle) widens the union to the
+    /// wildcard `"*"` = send everything, the pre-focus behavior. No clients
+    /// = empty list = send nothing upstream.
+    fn push_focus_to_desktop(state: &AccountState) {
+        let Some(desktop) = &state.desktop_tx else { return };
+        let mut union: HashSet<String> = HashSet::new();
+        let mut wildcard = false;
+        for c in &state.clients {
+            match c.tx.focus_snapshot() {
+                None => {
+                    wildcard = true;
+                    break;
+                }
+                Some(set) => union.extend(set),
+            }
+        }
+        let session_ids: Vec<String> = if wildcard {
+            vec!["*".to_string()]
+        } else {
+            union.into_iter().collect()
+        };
+        let msg = crate::protocol::ControlMessage::SessionFocus { session_ids };
+        let _ = desktop.send(WsMessage::Text(
+            serde_json::to_string(&msg).unwrap_or_default(),
+        ));
+    }
+
+    /// Recompute + push the focus union after a client changed its focus.
+    pub async fn push_focus_union(&self, username: &str) {
+        let accounts = self.accounts.read().await;
+        if let Some(state) = accounts.get(username) {
+            Self::push_focus_to_desktop(state);
+        }
+    }
+
     /// Send resync_required to a freshly-dirty client, at most once per
     /// RESYNC_MIN_INTERVAL_SECS. Spawned off the caller's lock scope-free
     /// clone so the broadcast path never blocks on the rate-limit mutex.
@@ -1317,10 +1367,64 @@ mod tests {
         assert!(focused_rx.try_recv().is_ok());
         assert!(unscoped_rx.try_recv().is_ok());
 
-        // Empty focus clears scoping.
+        // Empty focus = viewing nothing (session-list screen): no live output.
         focused.set_focus(Vec::new());
         broker.broadcast_to_clients("alice", output_frame("sess-b", b"z")).await;
-        assert!(focused_rx.try_recv().is_ok());
+        assert!(focused_rx.try_recv().is_err());
+        assert!(unscoped_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_focus_union_pushed_to_desktop() {
+        let broker = Broker::new();
+        let (dtx, mut drx) = test_conn();
+        broker.register_desktop("alice", dtx, None).await.unwrap();
+
+        let (c1, _c1rx) = test_conn();
+        let info = ClientInfo {
+            device_id: "dev-1".into(),
+            device_name: "Phone".into(),
+            ip: "1.2.3.4".into(),
+            connected_at: "now".into(),
+        };
+        broker.register_client("alice", c1.clone(), info).await.unwrap();
+
+        // Registration pushed a union; the fresh client is unscoped → wildcard.
+        let mut last = None;
+        while let Ok(m) = drx.try_recv() {
+            if let WsMessage::Text(t) = m {
+                if t.contains("session_focus") {
+                    last = Some(t);
+                }
+            }
+        }
+        assert!(last.expect("no session_focus pushed").contains("\"*\""));
+
+        // Client scopes itself → union becomes its set.
+        c1.set_focus(vec!["sess-a".into()]);
+        broker.push_focus_union("alice").await;
+        let mut last = None;
+        while let Ok(m) = drx.try_recv() {
+            if let WsMessage::Text(t) = m {
+                if t.contains("session_focus") {
+                    last = Some(t);
+                }
+            }
+        }
+        let msg = last.expect("no session_focus pushed after scoping");
+        assert!(msg.contains("sess-a") && !msg.contains("\"*\""));
+
+        // Client leaves → empty union = send nothing upstream.
+        broker.unregister_client("alice", "dev-1", &c1).await;
+        let mut last = None;
+        while let Ok(m) = drx.try_recv() {
+            if let WsMessage::Text(t) = m {
+                if t.contains("session_focus") {
+                    last = Some(t);
+                }
+            }
+        }
+        assert!(last.expect("no session_focus on departure").contains("\"sessionIds\":[]"));
     }
 
     #[tokio::test]

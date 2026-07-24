@@ -160,11 +160,13 @@ pub enum ControlMessage {
     },
     #[serde(rename = "session_list_request")]
     SessionListRequest,
-    /// Client → relay only (never forwarded): the session(s) this client is
-    /// actively viewing. The broker relays live PTY output only for focused
-    /// sessions; a client that never sends this (or sends an empty list)
-    /// receives every session's output — the pre-focus behavior, so old
-    /// clients are unaffected.
+    /// Two directions, same shape. Client → relay: the session(s) this client
+    /// is actively viewing (empty = viewing nothing; a client that NEVER
+    /// sends it stays unscoped and receives everything — old bundles).
+    /// Relay → desktop: the union of every client's focus, so the helper
+    /// stops sending unviewed sessions' output across the WAN; `"*"` in the
+    /// list means unscoped (some client predates focus), empty means no
+    /// client is viewing anything.
     #[serde(rename = "session_focus")]
     SessionFocus {
         #[serde(rename = "sessionIds")]

@@ -581,6 +581,10 @@ async fn handle_control_message(
                         // the first frame, so the pending snapshot (pushed even
                         // when empty, to clear stale local state) must follow it.
                         state.broker.push_pending_devices_list(&username).await;
+                        // Scope the fresh helper immediately: it boots
+                        // unscoped, and without this it streams every
+                        // session until a client's next focus change.
+                        state.broker.push_focus_union(&username).await;
                         audit::log_audit(
                             state.auth.db(),
                             AuditEvent::DesktopConnected,
@@ -848,11 +852,14 @@ async fn handle_control_message(
             }
         }
 
-        // Client → relay only: scope live PTY output to the session(s) this
-        // client is viewing. Never forwarded to the desktop.
+        // Client → relay: scope live PTY output to the session(s) this client
+        // is viewing. The client's own message is never forwarded, but the
+        // broker pushes the recomputed all-client union to the desktop so the
+        // helper stops sending unviewed sessions across the WAN entirely.
         ControlMessage::SessionFocus { session_ids } => {
-            if matches!(role, ConnectionRole::Client { .. }) {
+            if let ConnectionRole::Client { username, .. } = role {
                 outbound_tx.set_focus(session_ids.clone());
+                state.broker.push_focus_union(username).await;
             }
         }
 
