@@ -529,6 +529,7 @@ async fn handle_control_message(
             totp,
             device_token,
             desktop_key,
+            app_version,
             ..
         } => {
             // Validate username before processing
@@ -548,6 +549,7 @@ async fn handle_control_message(
                 totp.as_deref(),
                 device_token.as_deref(),
                 desktop_key.as_deref(),
+                app_version.as_deref(),
                 role,
                 state,
                 outbound_tx,
@@ -1257,12 +1259,43 @@ async fn handle_control_message(
     }
 }
 
+/// "1.2.3" (optional leading `v`) → (1, 2, 3); missing patch defaults to 0.
+fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = s.trim().trim_start_matches('v').split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = match parts.next() {
+        Some(p) => p.parse().ok()?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// True when the client must be refused. An unparseable `min` disables the
+/// gate (a config typo must not lock every client out); an absent or
+/// unparseable client version is refused (pre-gate clients are exactly the
+/// stale tabs the gate exists for).
+fn version_gate_blocks(app_version: Option<&str>, min: &str) -> bool {
+    let Some(min_v) = parse_semver(min) else {
+        tracing::warn!(min = %min, "min_client_version unparseable; version gate disabled");
+        return false;
+    };
+    match app_version.and_then(parse_semver) {
+        Some(v) => v < min_v,
+        None => true,
+    }
+}
+
 async fn handle_auth(
     username: &str,
     password_hash: Option<&str>,
     totp: Option<&str>,
     device_token: Option<&str>,
     desktop_key: Option<&str>,
+    app_version: Option<&str>,
     role: &mut ConnectionRole,
     state: &Arc<AppState>,
     outbound_tx: &ConnTx,
@@ -1332,6 +1365,38 @@ async fn handle_auth(
             );
         }
         return;
+    }
+
+    // --- Version gate: with `min_client_version` configured, web clients below
+    // it — including clients too old to send appVersion at all — are refused.
+    // A long-open tab keeps running whatever bundle it loaded days ago (the
+    // 2026-07-24 rename storm was re-armed by exactly such a tab); refusal
+    // stops its reconnect loop cleanly. Desktops (desktop_key above) are never
+    // gated — their version story is the app updater. ---
+    if let Ok(Some(min)) = state.auth.db().get_config("min_client_version") {
+        if version_gate_blocks(app_version, &min) {
+            let result = ControlMessage::AuthResult {
+                success: false,
+                token: None,
+                device_id: None,
+                error: Some(format!(
+                    "This app is {} but the relay requires v{min} or newer — reload the page or update the app.",
+                    app_version.map(|v| format!("v{v}")).unwrap_or_else(|| "an old version".into()),
+                )),
+                retry_after: None,
+            };
+            let _ = outbound_tx
+                .send(WsMessage::Text(serde_json::to_string(&result).unwrap()));
+            audit::log_audit(
+                state.auth.db(),
+                AuditEvent::AuthFailure,
+                Some(username),
+                None,
+                Some(ip),
+                Some("outdated client version"),
+            );
+            return;
+        }
     }
 
     // --- Returning device: a valid device token short-circuits BEFORE the
@@ -1907,6 +1972,26 @@ mod tests {
         let upload_id = "u".repeat(36);
         let frame = protocol::build_binary_frame(protocol::PTY_FILE_CHUNK, &upload_id, payload);
         (upload_id, frame)
+    }
+
+    #[test]
+    fn test_version_gate_semantics() {
+        // Below / at / above the minimum.
+        assert!(version_gate_blocks(Some("0.9.15"), "0.9.16"));
+        assert!(!version_gate_blocks(Some("0.9.16"), "0.9.16"));
+        assert!(!version_gate_blocks(Some("0.10.0"), "0.9.16"));
+        assert!(!version_gate_blocks(Some("1.0.0"), "0.9.16"));
+        // Numeric compare, not lexicographic.
+        assert!(version_gate_blocks(Some("0.9.2"), "0.9.16"));
+        // Pre-gate clients (no version) and garbage versions are refused.
+        assert!(version_gate_blocks(None, "0.9.16"));
+        assert!(version_gate_blocks(Some("not-a-version"), "0.9.16"));
+        // Leading v and missing patch are tolerated.
+        assert!(!version_gate_blocks(Some("v0.9.16"), "0.9.16"));
+        assert!(!version_gate_blocks(Some("0.10"), "0.9.16"));
+        // An unparseable minimum disables the gate rather than locking out.
+        assert!(!version_gate_blocks(Some("0.0.1"), "latest"));
+        assert!(!version_gate_blocks(None, "latest"));
     }
 
     #[tokio::test]

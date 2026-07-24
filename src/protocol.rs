@@ -104,6 +104,12 @@ pub enum ControlMessage {
         /// Bypasses password/TOTP/approval and authorizes desktop registration.
         #[serde(rename = "desktopKey", skip_serializing_if = "Option::is_none")]
         desktop_key: Option<String>,
+        /// Client app version (e.g. "0.9.16"). Absent on clients that predate
+        /// the version gate; when the `min_client_version` config is set, those
+        /// are refused along with anything below the minimum, so a stale
+        /// long-open tab can't keep running old code against the relay.
+        #[serde(rename = "appVersion", default, skip_serializing_if = "Option::is_none")]
+        app_version: Option<String>,
     },
     #[serde(rename = "auth_result")]
     AuthResult {
