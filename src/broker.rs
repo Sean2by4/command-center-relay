@@ -1028,21 +1028,18 @@ impl Broker {
     fn push_focus_to_desktop(state: &AccountState) {
         let Some(desktop) = &state.desktop_tx else { return };
         let mut union: HashSet<String> = HashSet::new();
-        let mut wildcard = false;
         for c in &state.clients {
-            match c.tx.focus_snapshot() {
-                None => {
-                    wildcard = true;
-                    break;
-                }
-                Some(set) => union.extend(set),
+            // Never-scoped clients (old bundles / forgotten tabs) are
+            // deliberately EXCLUDED from the union: one stale tab used to pin
+            // it at wildcard and re-open the full-fleet firehose for every
+            // device (2026-07-24). An old client's terminals still converge
+            // via resync replays (rings record everything); it just loses
+            // live streaming until reloaded.
+            if let Some(set) = c.tx.focus_snapshot() {
+                union.extend(set);
             }
         }
-        let session_ids: Vec<String> = if wildcard {
-            vec!["*".to_string()]
-        } else {
-            union.into_iter().collect()
-        };
+        let session_ids: Vec<String> = union.into_iter().collect();
         let msg = crate::protocol::ControlMessage::SessionFocus { session_ids };
         let _ = desktop.send(WsMessage::Text(
             serde_json::to_string(&msg).unwrap_or_default(),
@@ -1389,7 +1386,9 @@ mod tests {
         };
         broker.register_client("alice", c1.clone(), info).await.unwrap();
 
-        // Registration pushed a union; the fresh client is unscoped → wildcard.
+        // Registration pushed a union; unscoped clients are excluded, so the
+        // union is empty until the client scopes itself (a stale tab must
+        // never re-open the full firehose for everyone).
         let mut last = None;
         while let Ok(m) = drx.try_recv() {
             if let WsMessage::Text(t) = m {
@@ -1398,7 +1397,9 @@ mod tests {
                 }
             }
         }
-        assert!(last.expect("no session_focus pushed").contains("\"*\""));
+        assert!(last
+            .expect("no session_focus pushed")
+            .contains("\"sessionIds\":[]"));
 
         // Client scopes itself → union becomes its set.
         c1.set_focus(vec!["sess-a".into()]);

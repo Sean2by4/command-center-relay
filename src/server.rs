@@ -880,6 +880,23 @@ async fn handle_control_message(
             }
         }
 
+        // Single-session replay (tab switch on a focus-scoped client): same
+        // routing as a full list request — the desktop's burst ends with a
+        // session_list, which closes the replay target normally.
+        ControlMessage::SessionReplayRequest { .. } => {
+            if let ConnectionRole::Client { username, device_id } = role {
+                state
+                    .broker
+                    .note_session_list_request(username, device_id, outbound_tx)
+                    .await;
+                let json = serde_json::to_string(msg).unwrap();
+                let _ = state
+                    .broker
+                    .send_to_desktop(username, WsMessage::Text(json))
+                    .await;
+            }
+        }
+
         // Desktop announces the start of a replay burst. Consumed here —
         // never forwarded.
         ControlMessage::ReplayBegin => {

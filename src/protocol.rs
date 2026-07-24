@@ -160,6 +160,15 @@ pub enum ControlMessage {
     },
     #[serde(rename = "session_list_request")]
     SessionListRequest,
+    /// Client → desktop (relay routes the reply burst like a list request):
+    /// replay ONE session's scrollback — the tab-switch convergence path for
+    /// focus-scoped clients. A full list request drags every session's ring
+    /// across the wire (~600KB); switching tabs only needs the one.
+    #[serde(rename = "session_replay_request")]
+    SessionReplayRequest {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
     /// Two directions, same shape. Client → relay: the session(s) this client
     /// is actively viewing (empty = viewing nothing; a client that NEVER
     /// sends it stays unscoped and receives everything — old bundles).
