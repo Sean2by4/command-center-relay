@@ -42,6 +42,45 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// Per-IP WebSocket connection rate limiter: IP -> list of connection timestamps.
     ws_rate_limits: Mutex<HashMap<String, Vec<std::time::Instant>>>,
+    /// Last-known label per session (see the client-rename arm in `handle_control`).
+    session_labels: Mutex<SessionLabels>,
+}
+
+/// Last-known label per session, per account (username -> session -> label).
+/// Fed by desktop session_list / session_created / session_renamed frames and
+/// by client renames as they're forwarded. Its one job: recognize a client
+/// rename that matches the session's current label — that's an echo of a
+/// broadcast (or a no-op), and forwarding it back to the desktop is what let
+/// one echoing client sustain the 2026-07-24/25 rename storms.
+#[derive(Default)]
+struct SessionLabels(HashMap<String, HashMap<String, String>>);
+
+impl SessionLabels {
+    /// True when `label` already is the session's last-known label.
+    fn is_noop(&self, username: &str, session_id: &str, label: &str) -> bool {
+        self.0
+            .get(username)
+            .and_then(|m| m.get(session_id))
+            .is_some_and(|l| l == label)
+    }
+
+    fn note(&mut self, username: &str, session_id: &str, label: &str) {
+        self.0
+            .entry(username.to_string())
+            .or_default()
+            .insert(session_id.to_string(), label.to_string());
+    }
+
+    /// Authoritative roster replace (desktop session_list): prunes closed sessions.
+    fn replace(&mut self, username: &str, labels: impl Iterator<Item = (String, String)>) {
+        self.0.insert(username.to_string(), labels.collect());
+    }
+
+    fn forget(&mut self, username: &str, session_id: &str) {
+        if let Some(m) = self.0.get_mut(username) {
+            m.remove(session_id);
+        }
+    }
 }
 
 impl AppState {
@@ -52,6 +91,7 @@ impl AppState {
             push,
             data_dir,
             ws_rate_limits: Mutex::new(HashMap::new()),
+            session_labels: Mutex::new(SessionLabels::default()),
         }
     }
 
@@ -974,16 +1014,34 @@ async fn handle_control_message(
         }
 
         // Bidirectional: client renames forward to desktop, desktop renames broadcast to clients
-        ControlMessage::SessionRenamed { .. } => {
+        ControlMessage::SessionRenamed { session_id, label } => {
             let json = serde_json::to_string(msg).unwrap();
             match role {
                 ConnectionRole::Client { username, .. } => {
+                    // A rename to the session's current label is an echo of a
+                    // broadcast (or a no-op). Forwarding it re-broadcasts it to
+                    // every client, so a single client that echoes what it
+                    // receives turns the reflection into a self-sustaining
+                    // storm (~10 label flips/s per session, 2026-07-25). Drop
+                    // echoes here; the desktop never needs to hear them.
+                    let mut labels = state.session_labels.lock().await;
+                    if labels.is_noop(username, session_id, label) {
+                        tracing::debug!(session = %session_id, "dropping no-op client rename (echo)");
+                        return;
+                    }
+                    labels.note(username, session_id, label);
+                    drop(labels);
                     let _ = state
                         .broker
                         .send_to_desktop(username, WsMessage::Text(json))
                         .await;
                 }
                 ConnectionRole::Desktop { username } => {
+                    state
+                        .session_labels
+                        .lock()
+                        .await
+                        .note(username, session_id, label);
                     state
                         .broker
                         .broadcast_to_clients(username, WsMessage::Text(json))
@@ -1000,6 +1058,19 @@ async fn handle_control_message(
         | ControlMessage::AccountUsage { .. }
         | ControlMessage::PtyResized { .. } => {
             if let ConnectionRole::Desktop { username } = role {
+                match msg {
+                    ControlMessage::SessionCreated { session_id, label, .. } => {
+                        state
+                            .session_labels
+                            .lock()
+                            .await
+                            .note(username, session_id, label);
+                    }
+                    ControlMessage::SessionClosed { session_id } => {
+                        state.session_labels.lock().await.forget(username, session_id);
+                    }
+                    _ => {}
+                }
                 let json = serde_json::to_string(msg).unwrap();
                 state
                     .broker
@@ -1011,8 +1082,12 @@ async fn handle_control_message(
         // A session_list terminates a replay burst: routed to the requester
         // when the desktop tagged the burst (replay_begin), broadcast for old
         // desktops that don't.
-        ControlMessage::SessionList { .. } => {
+        ControlMessage::SessionList { sessions, .. } => {
             if let ConnectionRole::Desktop { username } = role {
+                state.session_labels.lock().await.replace(
+                    username,
+                    sessions.iter().map(|s| (s.id.clone(), s.label.clone())),
+                );
                 let json = serde_json::to_string(msg).unwrap();
                 match state.broker.end_replay(username).await {
                     Some(tx) => {
@@ -1929,6 +2004,51 @@ mod tests {
         assert_eq!(sanitize_for_log("line1\nline2"), "line1_line2");
         assert_eq!(sanitize_for_log("cr\rhere"), "cr_here");
         assert_eq!(sanitize_for_log("null\x00byte"), "null_byte");
+    }
+
+    // --- Rename echo suppression ---
+
+    #[test]
+    fn test_session_labels_echo_is_noop() {
+        // Desktop broadcasts a rename; a client echoing that exact label back
+        // must be recognized as a no-op, while a genuine new label must not.
+        let mut labels = SessionLabels::default();
+        labels.note("sean", "s1", "whoop analysis");
+        assert!(labels.is_noop("sean", "s1", "whoop analysis"));
+        assert!(!labels.is_noop("sean", "s1", "different label"));
+        assert!(!labels.is_noop("sean", "s2", "whoop analysis"));
+        assert!(!labels.is_noop("other", "s1", "whoop analysis"));
+    }
+
+    #[test]
+    fn test_session_labels_unknown_session_never_noop() {
+        // No recorded label -> always forward (first rename must go through).
+        let labels = SessionLabels::default();
+        assert!(!labels.is_noop("sean", "s1", "anything"));
+    }
+
+    #[test]
+    fn test_session_labels_alternating_echo_converges() {
+        // The 2026-07-25 storm signature: two labels for one session chasing
+        // each other. Every echo re-sends the label just recorded, so with
+        // suppression each incoming echo is a no-op once its label is current.
+        let mut labels = SessionLabels::default();
+        labels.note("sean", "s1", "NEW"); // client rename forwarded
+        assert!(labels.is_noop("sean", "s1", "NEW")); // echo of NEW -> dropped
+        labels.note("sean", "s1", "OLD"); // stale echo of OLD -> forwarded once, recorded
+        assert!(labels.is_noop("sean", "s1", "OLD")); // its own echo -> dropped
+    }
+
+    #[test]
+    fn test_session_labels_replace_prunes_closed() {
+        let mut labels = SessionLabels::default();
+        labels.note("sean", "s1", "a");
+        labels.note("sean", "s2", "b");
+        labels.replace("sean", vec![("s2".to_string(), "b2".to_string())].into_iter());
+        assert!(!labels.is_noop("sean", "s1", "a"));
+        assert!(labels.is_noop("sean", "s2", "b2"));
+        labels.forget("sean", "s2");
+        assert!(!labels.is_noop("sean", "s2", "b2"));
     }
 
     // --- File upload routing / role-gating ---
