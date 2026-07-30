@@ -256,6 +256,17 @@ pub enum ControlMessage {
         #[serde(rename = "maxTokens", default, skip_serializing_if = "Option::is_none")]
         max_tokens: Option<u64>,
     },
+    /// One word for what a session is working ON (desktop → clients), shown
+    /// under the project name its label carries. Derived by the desktop from
+    /// the session transcript; the relay only forwards it. Empty clears it.
+    /// Not to be confused with `session_focus`, which is the set of sessions a
+    /// client is VIEWING.
+    #[serde(rename = "session_topic")]
+    SessionTopic {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        topic: String,
+    },
     /// Per-account plan rate-limit usage (desktop → clients). Mirrored across
     /// transit; the relay never inspects it.
     #[serde(rename = "account_usage")]
@@ -1034,6 +1045,31 @@ mod tests {
                 assert_eq!(last_fingerprint.unwrap(), "fp-1");
             }
             _ => panic!("expected SupervisorQuery"),
+        }
+    }
+
+    #[test]
+    /// The relay re-serializes every control message, so a frame shape it does
+    /// not know is a frame it silently drops. This fixture is the same bytes
+    /// the desktop emits and the web client parses — if any of the three drift,
+    /// the topic word stops arriving with no error anywhere.
+    #[test]
+    fn test_session_topic_golden_fixture() {
+        let fix = r#"{"type":"session_topic","sessionId":"tab-1","topic":"mass"}"#;
+        let msg = ControlMessage::SessionTopic {
+            session_id: "tab-1".into(),
+            topic: "mass".into(),
+        };
+        let got: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        let want: serde_json::Value = serde_json::from_str(fix).unwrap();
+        assert_eq!(got, want);
+        match serde_json::from_str::<ControlMessage>(fix).unwrap() {
+            ControlMessage::SessionTopic { session_id, topic } => {
+                assert_eq!(session_id, "tab-1");
+                assert_eq!(topic, "mass");
+            }
+            other => panic!("expected SessionTopic, got {other:?}"),
         }
     }
 
