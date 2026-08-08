@@ -927,6 +927,26 @@ mod tests {
         }
     }
 
+    /// Byte-for-byte the same fixture the desktop's cc-proto test pins. If the
+    /// two drift, this relay answers the client's repaint with "invalid JSON
+    /// message" and drops it — the button looks like it worked and the screen
+    /// stays garbled, which is exactly the silence this test exists to break.
+    #[test]
+    fn test_session_redraw_request_matches_the_desktop_fixture() {
+        let fixture = r#"{"type":"session_redraw_request","sessionId":"tab-1"}"#;
+        let msg: ControlMessage = serde_json::from_str(fixture).unwrap();
+        match &msg {
+            ControlMessage::SessionRedrawRequest { session_id } => {
+                assert_eq!(session_id, "tab-1");
+            }
+            _ => panic!("expected SessionRedrawRequest"),
+        }
+        let got: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        let want: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn test_old_desktop_register_without_capabilities_parses() {
         // Old desktops omit the field entirely — serde default fills None.
