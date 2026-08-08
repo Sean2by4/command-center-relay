@@ -647,6 +647,7 @@ async fn handle_control_message(
         // Client -> Desktop forwarding
         ControlMessage::SessionSpawnRequest { .. }
         | ControlMessage::SessionCloseRequest { .. }
+        | ControlMessage::SessionRedrawRequest { .. }
         | ControlMessage::PtyResize { .. } => {
             if let ConnectionRole::Client { username, .. } = role {
                 let json = serde_json::to_string(msg).unwrap();

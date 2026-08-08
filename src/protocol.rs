@@ -232,6 +232,14 @@ pub enum ControlMessage {
         #[serde(rename = "sessionId")]
         session_id: String,
     },
+    /// Client asks the desktop to repaint a session's TUI (a PTY size jiggle on
+    /// the desktop side, never injected input). The relay only forwards it; the
+    /// desktop decides whether the session still exists.
+    #[serde(rename = "session_redraw_request")]
+    SessionRedrawRequest {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
 
     // --- Session events (desktop → clients) ---
     /// A long-running session finished working; fan out to clients (and web
