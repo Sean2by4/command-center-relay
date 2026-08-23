@@ -42,6 +42,10 @@ pub struct AccountMeta {
     /// Opaque to the relay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// The account runs its own harness and must never be auto-picked; omitted
+    /// by desktops when false. Opaque to the relay — PWA pickers read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standalone: Option<bool>,
 }
 
 /// Per-account plan-usage snapshot carried on `account_usage`. TRULY opaque to
@@ -722,7 +726,7 @@ mod tests {
     fn test_session_kind_and_roster_provider_roundtrip() {
         // New desktop: per-session kind + roster provider (codex only; claude
         // entries omit it). Both survive transit and re-serialize identically.
-        let json = r##"{"type":"session_list","sessions":[{"id":"a","label":"L1","cwd":"/","cols":80,"rows":24,"accountId":"codex","kind":"codex"},{"id":"b","label":"L2","cwd":"/","cols":80,"rows":24,"accountId":"primary","kind":"claude"}],"accounts":[{"id":"primary","color":"#7aa2f7","status":"ok"},{"id":"codex","color":"#73daca","status":"ok","provider":"codex"}]}"##;
+        let json = r##"{"type":"session_list","sessions":[{"id":"a","label":"L1","cwd":"/","cols":80,"rows":24,"accountId":"codex","kind":"codex"},{"id":"b","label":"L2","cwd":"/","cols":80,"rows":24,"accountId":"primary","kind":"claude"}],"accounts":[{"id":"primary","color":"#7aa2f7","status":"ok"},{"id":"codex","color":"#73daca","status":"ok","provider":"codex"},{"id":"music","color":"#e0af68","status":"ok","standalone":true}]}"##;
         let parsed: ControlMessage = serde_json::from_str(json).unwrap();
         match &parsed {
             ControlMessage::SessionList { sessions, accounts } => {
@@ -730,7 +734,11 @@ mod tests {
                 assert_eq!(sessions[1].kind.as_deref(), Some("claude"));
                 let roster = accounts.as_ref().expect("accounts present");
                 assert_eq!(roster[0].provider, None);
+                assert_eq!(roster[0].standalone, None);
                 assert_eq!(roster[1].provider.as_deref(), Some("codex"));
+                // A standalone roster entry survives transit, so a PWA picker
+                // can skip it exactly like the desktop does.
+                assert_eq!(roster[2].standalone, Some(true));
             }
             _ => panic!("expected SessionList"),
         }
