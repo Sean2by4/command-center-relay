@@ -167,6 +167,13 @@ pub enum ControlMessage {
         rows: u16,
         #[serde(rename = "accountId", default, skip_serializing_if = "Option::is_none")]
         account_id: Option<String>,
+        /// The client pinned this exact account deliberately (vs its auto-pick).
+        /// Opaque to the relay — the desktop refuses to auto-spawn a standalone
+        /// account, and this bit is what lets a deliberate pin of one through.
+        /// A relay without this field strips it in re-serialization, which the
+        /// desktop treats as NOT explicit (fails closed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        explicit: Option<bool>,
     },
     #[serde(rename = "session_list_request")]
     SessionListRequest,
@@ -627,13 +634,30 @@ mod tests {
         let json = r#"{"type":"session_spawn_request","cols":80,"rows":24,"accountId":"acct-7"}"#;
         let parsed: ControlMessage = serde_json::from_str(json).unwrap();
         match &parsed {
-            ControlMessage::SessionSpawnRequest { cols, rows, account_id } => {
+            ControlMessage::SessionSpawnRequest { cols, rows, account_id, explicit } => {
                 assert_eq!(*cols, 80);
                 assert_eq!(*rows, 24);
                 assert_eq!(account_id.as_deref(), Some("acct-7"));
+                assert_eq!(*explicit, None);
             }
             _ => panic!("expected SessionSpawnRequest"),
         }
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
+    }
+
+    #[test]
+    fn test_session_spawn_request_explicit_pin_roundtrips() {
+        // The deliberate-pin bit must survive the relay's deserialize →
+        // re-serialize hop: the desktop refuses standalone auto-picks and only
+        // this flag lets a deliberate pin of a standalone account through.
+        let json = r#"{"type":"session_spawn_request","cols":80,"rows":24,"accountId":"music","explicit":true}"#;
+        let parsed: ControlMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            parsed,
+            ControlMessage::SessionSpawnRequest { explicit: Some(true), .. }
+        ));
         let reser: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());

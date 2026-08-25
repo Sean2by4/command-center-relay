@@ -153,6 +153,10 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
     axum::Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        // Git short sha stamped by build.rs — the only field that can prove
+        // WHICH build is serving (the package version alone sat at 0.1.0
+        // across a month of deploys while the wire protocol moved under it).
+        "commit": env!("GIT_SHA"),
         "connections": connections,
     }))
 }
