@@ -118,12 +118,21 @@ pub fn build_router(state: Arc<AppState>, static_dir: PathBuf) -> Router {
     // Always use fallback so the type is consistent (ServeDir<ServeFile>)
     let serve_dir = ServeDir::new(&static_dir).fallback(ServeFile::new(spa_fallback));
 
-    // Restrict CORS to deny cross-origin requests (API-only server)
+    // Preserve the existing policy for non-report routes. Report history can
+    // connect from either hosted PWA to either relay using its device bearer.
     let cors = CorsLayer::new().allow_origin(AllowOrigin::exact(HeaderValue::from_static("null")));
-
-    Router::new()
-        .route("/health", axum::routing::get(health_handler))
-        .route("/ws", axum::routing::get(ws_handler))
+    let report_cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::list([
+            HeaderValue::from_static("https://dev.bakemono.online"),
+            HeaderValue::from_static("https://relay.bakemono.online"),
+            HeaderValue::from_static("null"),
+        ]))
+        .allow_methods([axum::http::Method::GET, axum::http::Method::PATCH])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+        ]);
+    let report_routes = Router::new()
         .route("/bug-reports", axum::routing::get(list_bug_reports_handler))
         .route(
             "/bug-reports/{id}",
@@ -133,8 +142,14 @@ pub fn build_router(state: Arc<AppState>, static_dir: PathBuf) -> Router {
             "/bug-reports/{id}/screenshot",
             axum::routing::get(bug_report_screenshot_handler),
         )
+        .layer(report_cors);
+
+    Router::new()
+        .route("/health", axum::routing::get(health_handler))
+        .route("/ws", axum::routing::get(ws_handler))
         .fallback_service(serve_dir)
         .layer(cors)
+        .merge(report_routes)
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
@@ -3160,6 +3175,122 @@ mod tests {
             format!("Bearer {token}").parse().unwrap(),
         );
         h
+    }
+
+    #[tokio::test]
+    async fn bug_report_tracking_cors_allows_only_report_origins_and_methods() {
+        use axum::http::header::{
+            ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+        };
+        use tower::ServiceExt;
+        let state = test_state();
+        let app = build_router(state.clone(), state.data_dir.clone());
+        for origin in [
+            "https://dev.bakemono.online",
+            "https://relay.bakemono.online",
+            "null",
+        ] {
+            for (path, method) in [
+                ("/bug-reports", "GET"),
+                ("/bug-reports/1", "PATCH"),
+                ("/bug-reports/1/screenshot", "GET"),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("OPTIONS")
+                            .uri(path)
+                            .header("origin", origin)
+                            .header("access-control-request-method", method)
+                            .header(
+                                "access-control-request-headers",
+                                "authorization,content-type",
+                            )
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(response.status().is_success());
+                let headers = response.headers();
+                assert_eq!(headers[ACCESS_CONTROL_ALLOW_ORIGIN], origin);
+                let methods = headers[ACCESS_CONTROL_ALLOW_METHODS].to_str().unwrap();
+                assert!(methods.split(',').any(|value| value.trim() == method));
+                assert!(!methods.contains("DELETE"));
+                let allowed_headers = headers[ACCESS_CONTROL_ALLOW_HEADERS]
+                    .to_str()
+                    .unwrap()
+                    .to_ascii_lowercase();
+                assert!(allowed_headers.contains("authorization"));
+                assert!(allowed_headers.contains("content-type"));
+            }
+        }
+        for origin in [
+            "https://untrusted.example",
+            "https://dev.bakemono.online.evil.example",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("OPTIONS")
+                        .uri("/bug-reports/1")
+                        .header("origin", origin)
+                        .header("access-control-request-method", "PATCH")
+                        .header(
+                            "access-control-request-headers",
+                            "authorization,content-type",
+                        )
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(response
+                .headers()
+                .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none());
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/bug-reports")
+                    .header("origin", "https://dev.bakemono.online")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://dev.bakemono.online"
+        );
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/health")
+                    .header("origin", "https://dev.bakemono.online")
+                    .header("access-control-request-method", "PATCH")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response
+                .headers()
+                .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://dev.bakemono.online")
+        );
+        assert!(response
+            .headers()
+            .get(ACCESS_CONTROL_ALLOW_METHODS)
+            .is_none());
     }
 
     #[tokio::test]
