@@ -46,6 +46,9 @@ pub struct BugReport {
     pub screenshot_path: Option<String>,
     pub app_version: Option<String>,
     pub created_at: String,
+    pub status: String,
+    pub resolution: Option<String>,
+    pub closed_at: Option<String>,
 }
 
 #[derive(Clone)]
@@ -91,6 +94,18 @@ impl Database {
         conn.execute_batch(include_str!("../migrations/001_initial.sql"))?;
         conn.execute_batch(include_str!("../migrations/002_push_subscriptions.sql"))?;
         conn.execute_batch(include_str!("../migrations/003_bug_reports.sql"))?;
+        // ALTER TABLE has no IF NOT EXISTS; serialize the check and all three
+        // columns in one transaction so a restart cannot see a partial migration.
+        let tx = conn.unchecked_transaction()?;
+        let migrated: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bug_reports') WHERE name = 'status')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !migrated {
+            tx.execute_batch(include_str!("../migrations/004_bug_report_tracking.sql"))?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -174,7 +189,13 @@ impl Database {
 
     // --- Devices ---
 
-    pub fn add_device(&self, id: &str, username: &str, name: &str, ip: Option<&str>) -> Result<(), DbError> {
+    pub fn add_device(
+        &self,
+        id: &str,
+        username: &str,
+        name: &str,
+        ip: Option<&str>,
+    ) -> Result<(), DbError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO devices (id, username, name, last_ip) VALUES (?1, ?2, ?3, ?4)",
@@ -269,7 +290,10 @@ impl Database {
     }
 
     /// All push subscriptions for an account, as (device_id, subscription_json).
-    pub fn list_push_subscriptions(&self, username: &str) -> Result<Vec<(String, String)>, DbError> {
+    pub fn list_push_subscriptions(
+        &self,
+        username: &str,
+    ) -> Result<Vec<(String, String)>, DbError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT device_id, subscription_json FROM push_subscriptions WHERE username = ?1",
@@ -393,14 +417,19 @@ impl Database {
     }
 
     /// List bug reports for an account, newest first, capped at `limit` rows.
-    pub fn list_bug_reports(&self, username: &str, limit: usize) -> Result<Vec<BugReport>, DbError> {
+    pub fn list_bug_reports(
+        &self,
+        username: &str,
+        limit: usize,
+        status: Option<&str>,
+    ) -> Result<Vec<BugReport>, DbError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, device_id, device_name, text, screenshot_path, app_version, created_at
-             FROM bug_reports WHERE username = ?1 ORDER BY id DESC LIMIT ?2",
+            "SELECT id, device_id, device_name, text, screenshot_path, app_version, created_at, status, resolution, closed_at
+             FROM bug_reports WHERE username = ?1 AND (?3 IS NULL OR status = ?3) ORDER BY id DESC LIMIT ?2",
         )?;
         let reports = stmt
-            .query_map(params![username, limit as i64], |row| {
+            .query_map(params![username, limit as i64, status], |row| {
                 Ok(BugReport {
                     id: row.get(0)?,
                     device_id: row.get(1)?,
@@ -409,6 +438,9 @@ impl Database {
                     screenshot_path: row.get(4)?,
                     app_version: row.get(5)?,
                     created_at: row.get(6)?,
+                    status: row.get(7)?,
+                    resolution: row.get(8)?,
+                    closed_at: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -421,7 +453,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let report = conn
             .query_row(
-                "SELECT id, device_id, device_name, text, screenshot_path, app_version, created_at
+                "SELECT id, device_id, device_name, text, screenshot_path, app_version, created_at, status, resolution, closed_at
                  FROM bug_reports WHERE id = ?1 AND username = ?2",
                 params![id, username],
                 |row| {
@@ -433,11 +465,33 @@ impl Database {
                         screenshot_path: row.get(4)?,
                         app_version: row.get(5)?,
                         created_at: row.get(6)?,
+                        status: row.get(7)?,
+                        resolution: row.get(8)?,
+                        closed_at: row.get(9)?,
                     })
                 },
             )
             .optional()?;
         Ok(report)
+    }
+
+    pub fn update_bug_report(
+        &self,
+        username: &str,
+        id: i64,
+        status: &str,
+        resolution: Option<&str>,
+    ) -> Result<Option<BugReport>, DbError> {
+        let changed = self.conn.lock().unwrap().execute(
+            "UPDATE bug_reports SET status = ?3, resolution = CASE WHEN ?3 = 'closed' THEN ?4 ELSE NULL END,
+             closed_at = CASE WHEN ?3 = 'closed' THEN COALESCE(closed_at, datetime('now')) ELSE NULL END
+             WHERE id = ?1 AND username = ?2",
+            params![id, username, status, resolution],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.get_bug_report(username, id)
     }
 
     /// Read all persisted bug reports (test-only; no prod read API yet).
@@ -469,6 +523,28 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bug_report_tracking_migrates_existing_rows_and_restarts() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../migrations/003_bug_reports.sql"))
+            .unwrap();
+        conn.execute("INSERT INTO bug_reports (username, device_id, text) VALUES ('alice', 'old', 'existing')", []).unwrap();
+        let db = Database {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        db.run_migrations().unwrap();
+        db.run_migrations().unwrap();
+        let conn = db.conn.lock().unwrap();
+        let tracking: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, resolution, closed_at FROM bug_reports WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(tracking, ("open".into(), None, None));
+    }
 
     fn test_db() -> Database {
         Database::open_in_memory().unwrap()
@@ -547,8 +623,14 @@ mod tests {
         let db = test_db();
         db.log_event("auth_success", Some("alice"), None, Some("1.2.3.4"), None)
             .unwrap();
-        db.log_event("auth_failure", Some("bob"), None, Some("5.6.7.8"), Some("bad password"))
-            .unwrap();
+        db.log_event(
+            "auth_failure",
+            Some("bob"),
+            None,
+            Some("5.6.7.8"),
+            Some("bad password"),
+        )
+        .unwrap();
         // Just verify no errors — we don't expose a read API for audit_log in prod
     }
 
@@ -556,10 +638,17 @@ mod tests {
     fn test_insert_bug_report_resolves_device_name() {
         let db = test_db();
         db.create_account("alice", "hash", None, None).unwrap();
-        db.add_device("dev-1", "alice", "Pixel 9", Some("1.2.3.4")).unwrap();
+        db.add_device("dev-1", "alice", "Pixel 9", Some("1.2.3.4"))
+            .unwrap();
 
         let id = db
-            .insert_bug_report("alice", "dev-1", "it broke", Some("bug-reports/x.png"), None)
+            .insert_bug_report(
+                "alice",
+                "dev-1",
+                "it broke",
+                Some("bug-reports/x.png"),
+                None,
+            )
             .unwrap();
         assert!(id > 0);
 

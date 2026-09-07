@@ -116,17 +116,19 @@ pub fn build_router(state: Arc<AppState>, static_dir: PathBuf) -> Router {
     let spa_fallback = static_dir.join("index.html");
 
     // Always use fallback so the type is consistent (ServeDir<ServeFile>)
-    let serve_dir = ServeDir::new(&static_dir)
-        .fallback(ServeFile::new(spa_fallback));
+    let serve_dir = ServeDir::new(&static_dir).fallback(ServeFile::new(spa_fallback));
 
     // Restrict CORS to deny cross-origin requests (API-only server)
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::exact(HeaderValue::from_static("null")));
+    let cors = CorsLayer::new().allow_origin(AllowOrigin::exact(HeaderValue::from_static("null")));
 
     Router::new()
         .route("/health", axum::routing::get(health_handler))
         .route("/ws", axum::routing::get(ws_handler))
         .route("/bug-reports", axum::routing::get(list_bug_reports_handler))
+        .route(
+            "/bug-reports/{id}",
+            axum::routing::patch(update_bug_report_handler),
+        )
         .route(
             "/bug-reports/{id}/screenshot",
             axum::routing::get(bug_report_screenshot_handler),
@@ -191,6 +193,7 @@ fn clamp_limit(requested: Option<usize>) -> usize {
 #[derive(serde::Deserialize)]
 struct BugReportListQuery {
     limit: Option<usize>,
+    status: Option<String>,
 }
 
 /// Wire shape for a listed bug report. Deliberately omits `username`
@@ -204,6 +207,67 @@ struct BugReportView {
     created_at: String,
     app_version: Option<String>,
     has_screenshot: bool,
+    status: String,
+    resolution: Option<String>,
+    closed_at: Option<String>,
+}
+
+impl From<crate::db::BugReport> for BugReportView {
+    fn from(r: crate::db::BugReport) -> Self {
+        Self {
+            id: r.id,
+            device_id: r.device_id,
+            device_name: r.device_name,
+            text: r.text,
+            created_at: r.created_at,
+            app_version: r.app_version,
+            has_screenshot: r.screenshot_path.is_some(),
+            status: r.status,
+            resolution: r.resolution,
+            closed_at: r.closed_at,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BugReportUpdate {
+    status: String,
+    resolution: Option<String>,
+}
+
+async fn update_bug_report_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    payload: Result<axum::Json<BugReportUpdate>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let username = match authenticate_bearer(&state, &headers) {
+        Ok(u) => u,
+        Err(code) => return code.into_response(),
+    };
+    let update = match payload {
+        Ok(axum::Json(update)) => update,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let resolution = update.resolution.as_deref().map(str::trim);
+    if !matches!(update.status.as_str(), "open" | "closed")
+        || (update.status == "closed" && resolution.is_none_or(str::is_empty))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match state
+        .auth
+        .db()
+        .update_bug_report(&username, id, &update.status, resolution)
+    {
+        Ok(Some(report)) => axum::Json(BugReportView::from(report)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to update bug report");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// GET /bug-reports — newest-first JSON list for the authenticated account.
@@ -217,20 +281,20 @@ async fn list_bug_reports_handler(
         Err(code) => return code.into_response(),
     };
     let limit = clamp_limit(query.limit);
-    match state.auth.db().list_bug_reports(&username, limit) {
+    if query
+        .status
+        .as_deref()
+        .is_some_and(|status| !matches!(status, "open" | "closed"))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match state
+        .auth
+        .db()
+        .list_bug_reports(&username, limit, query.status.as_deref())
+    {
         Ok(reports) => {
-            let views: Vec<BugReportView> = reports
-                .into_iter()
-                .map(|r| BugReportView {
-                    id: r.id,
-                    device_id: r.device_id,
-                    device_name: r.device_name,
-                    text: r.text,
-                    created_at: r.created_at,
-                    app_version: r.app_version,
-                    has_screenshot: r.screenshot_path.is_some(),
-                })
-                .collect();
+            let views: Vec<BugReportView> = reports.into_iter().map(BugReportView::from).collect();
             axum::Json(views).into_response()
         }
         Err(e) => {
@@ -314,16 +378,30 @@ enum ConnectionRole {
     /// Parked after password/TOTP succeeded but the device still needs desktop
     /// approval. Carries the account + minted device_id so a disconnect before
     /// approval can garbage-collect the pending entry (ghost cleanup).
-    PendingApproval { username: String, device_id: String },
-    Desktop { username: String },
-    Client { username: String, device_id: String },
+    PendingApproval {
+        username: String,
+        device_id: String,
+    },
+    Desktop {
+        username: String,
+    },
+    Client {
+        username: String,
+        device_id: String,
+    },
 }
 
 /// Sanitize a string for safe inclusion in structured log fields.
 /// Replaces control characters and newlines to prevent log injection.
 fn sanitize_for_log(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_control() || c == '\n' || c == '\r' { '_' } else { c })
+        .map(|c| {
+            if c.is_control() || c == '\n' || c == '\r' {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -459,13 +537,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, ip: String) {
                 None,
             );
         }
-        ConnectionRole::PendingApproval { username, device_id } => {
+        ConnectionRole::PendingApproval {
+            username,
+            device_id,
+        } => {
             // Ghost cleanup: the client parked for approval closed before the
             // desktop acted. Drop its pending entry, roll back the provisional
             // device row, and refresh the desktop's pending list so the stale
             // approval card disappears.
-            if let Some(pending) =
-                state.broker.remove_pending_by_conn(username, &outbound_tx).await
+            if let Some(pending) = state
+                .broker
+                .remove_pending_by_conn(username, &outbound_tx)
+                .await
             {
                 let _ = device::revoke_device(state.auth.db(), &pending.device_id);
                 state.broker.push_pending_devices_list(username).await;
@@ -707,9 +790,8 @@ async fn handle_control_message(
                             path: None,
                             error: Some(reason.to_string()),
                         };
-                        let _ = outbound_tx.send(WsMessage::Text(
-                            serde_json::to_string(&fail).unwrap(),
-                        ));
+                        let _ = outbound_tx
+                            .send(WsMessage::Text(serde_json::to_string(&fail).unwrap()));
                     }
                 }
             }
@@ -744,7 +826,11 @@ async fn handle_control_message(
         // Client signals the upload is complete: mark it finished in governance
         // state and forward to the desktop to finalize the write.
         ControlMessage::FileUploadEnd { upload_id, text } => {
-            if let ConnectionRole::Client { username, device_id } = role {
+            if let ConnectionRole::Client {
+                username,
+                device_id,
+            } = role
+            {
                 // Bug reports are persisted at the relay (DB row + screenshot)
                 // before the normal pass-through. Persistence failures are
                 // logged and never break the pass-through path.
@@ -851,9 +937,8 @@ async fn handle_control_message(
                             ok: false,
                             error: Some(reason.to_string()),
                         };
-                        let _ = outbound_tx.send(WsMessage::Text(
-                            serde_json::to_string(&fail).unwrap(),
-                        ));
+                        let _ = outbound_tx
+                            .send(WsMessage::Text(serde_json::to_string(&fail).unwrap()));
                     }
                 }
             }
@@ -914,7 +999,11 @@ async fn handle_control_message(
         // + scrollback + session_list) can be routed back to the requester
         // only, instead of resetting every connected client's terminal.
         ControlMessage::SessionListRequest => {
-            if let ConnectionRole::Client { username, device_id } = role {
+            if let ConnectionRole::Client {
+                username,
+                device_id,
+            } = role
+            {
                 state
                     .broker
                     .note_session_list_request(username, device_id, outbound_tx)
@@ -931,7 +1020,11 @@ async fn handle_control_message(
         // routing as a full list request — the desktop's burst ends with a
         // session_list, which closes the replay target normally.
         ControlMessage::SessionReplayRequest { .. } => {
-            if let ConnectionRole::Client { username, device_id } = role {
+            if let ConnectionRole::Client {
+                username,
+                device_id,
+            } = role
+            {
                 state
                     .broker
                     .note_session_list_request(username, device_id, outbound_tx)
@@ -1329,8 +1422,9 @@ async fn handle_control_message(
                     None,
                 );
                 // Confirm to desktop
-                let _ = outbound_tx
-                    .send(WsMessage::Text(serde_json::to_string(&revoked_msg).unwrap()));
+                let _ = outbound_tx.send(WsMessage::Text(
+                    serde_json::to_string(&revoked_msg).unwrap(),
+                ));
             }
         }
 
@@ -1695,9 +1789,8 @@ async fn handle_binary_message(
                                 path: None,
                                 error: Some("size_exceeded".into()),
                             };
-                            let _ = outbound_tx.send(WsMessage::Text(
-                                serde_json::to_string(&fail).unwrap(),
-                            ));
+                            let _ = outbound_tx
+                                .send(WsMessage::Text(serde_json::to_string(&fail).unwrap()));
                         }
                         ChunkDecision::Drop => {}
                     }
@@ -1741,9 +1834,7 @@ async fn handle_binary_message(
                                 ok: false,
                                 error: Some("size_exceeded".into()),
                             };
-                            let _ = tx.send(WsMessage::Text(
-                                serde_json::to_string(&fail).unwrap(),
-                            ));
+                            let _ = tx.send(WsMessage::Text(serde_json::to_string(&fail).unwrap()));
                         }
                         DownloadChunkDecision::Drop => {}
                     }
@@ -1928,9 +2019,9 @@ pub async fn run(
                         error: Some("approval_timeout".into()),
                         retry_after: None,
                     };
-                    let _ = pending.client_tx.send(WsMessage::Text(
-                        serde_json::to_string(&result).unwrap(),
-                    ));
+                    let _ = pending
+                        .client_tx
+                        .send(WsMessage::Text(serde_json::to_string(&result).unwrap()));
                     let _ = device::revoke_device(gc_state.auth.db(), &pending.device_id);
                     audit::log_audit(
                         gc_state.auth.db(),
@@ -2050,7 +2141,10 @@ mod tests {
         let mut labels = SessionLabels::default();
         labels.note("sean", "s1", "a");
         labels.note("sean", "s2", "b");
-        labels.replace("sean", vec![("s2".to_string(), "b2".to_string())].into_iter());
+        labels.replace(
+            "sean",
+            vec![("s2".to_string(), "b2".to_string())].into_iter(),
+        );
         assert!(!labels.is_noop("sean", "s1", "a"));
         assert!(labels.is_noop("sean", "s2", "b2"));
         labels.forget("sean", "s2");
@@ -2470,19 +2564,37 @@ mod tests {
             ip: "1.2.3.4".into(),
             connected_at: "now".into(),
         };
-        state.broker.register_client("alice", owner.clone(), info("dev-1")).await.unwrap();
-        state.broker.register_client("alice", other.clone(), info("dev-2")).await.unwrap();
+        state
+            .broker
+            .register_client("alice", owner.clone(), info("dev-1"))
+            .await
+            .unwrap();
+        state
+            .broker
+            .register_client("alice", other.clone(), info("dev-2"))
+            .await
+            .unwrap();
 
         let (dtx, _drx) = test_conn();
-        state.broker.register_desktop("alice", dtx.clone(), None).await.unwrap();
+        state
+            .broker
+            .register_desktop("alice", dtx.clone(), None)
+            .await
+            .unwrap();
         // Drain the desktop-online broadcast both clients received.
         let _ = orx.try_recv();
         let _ = xrx.try_recv();
 
         let upload_id = "u".repeat(36);
-        state.broker.begin_upload("alice", &upload_id, 4096, &owner).await.unwrap();
+        state
+            .broker
+            .begin_upload("alice", &upload_id, 4096, &owner)
+            .await
+            .unwrap();
 
-        let mut role = ConnectionRole::Desktop { username: "alice".into() };
+        let mut role = ConnectionRole::Desktop {
+            username: "alice".into(),
+        };
         let result = ControlMessage::FileUploadResult {
             upload_id: upload_id.clone(),
             ok: true,
@@ -2649,7 +2761,9 @@ mod tests {
     // ride an inline JSON text frame (which the 16KB gate would drop).
 
     fn desktop_role() -> ConnectionRole {
-        ConnectionRole::Desktop { username: "alice".into() }
+        ConnectionRole::Desktop {
+            username: "alice".into(),
+        }
     }
 
     /// Build the begin/chunk(s)/end frames a desktop sends for one bug report,
@@ -2756,15 +2870,33 @@ mod tests {
         };
         process_ws_message(
             Message::Text(serde_json::to_string(&begin).unwrap().into()),
-            &mut role, &state, &ctx, "1.2.3.4",
-        ).await;
+            &mut role,
+            &state,
+            &ctx,
+            "1.2.3.4",
+        )
+        .await;
         let frame = protocol::build_binary_frame(protocol::PTY_FILE_CHUNK, &upload_id, b"\x89PNG");
-        process_ws_message(Message::Binary(frame.into()), &mut role, &state, &ctx, "1.2.3.4").await;
-        let end = ControlMessage::FileUploadEnd { upload_id, text: Some("x".into()) };
+        process_ws_message(
+            Message::Binary(frame.into()),
+            &mut role,
+            &state,
+            &ctx,
+            "1.2.3.4",
+        )
+        .await;
+        let end = ControlMessage::FileUploadEnd {
+            upload_id,
+            text: Some("x".into()),
+        };
         process_ws_message(
             Message::Text(serde_json::to_string(&end).unwrap().into()),
-            &mut role, &state, &ctx, "1.2.3.4",
-        ).await;
+            &mut role,
+            &state,
+            &ctx,
+            "1.2.3.4",
+        )
+        .await;
 
         assert!(state.auth.db().list_bug_reports_for_test().is_empty());
     }
@@ -2789,16 +2921,34 @@ mod tests {
         };
         process_ws_message(
             Message::Text(serde_json::to_string(&begin).unwrap().into()),
-            &mut role, &state, &ctx, "1.2.3.4",
-        ).await;
+            &mut role,
+            &state,
+            &ctx,
+            "1.2.3.4",
+        )
+        .await;
         // A chunk arrives anyway (attacker ignores the reject) — it must Drop.
         let frame = protocol::build_binary_frame(protocol::PTY_FILE_CHUNK, &upload_id, b"\x89PNG");
-        process_ws_message(Message::Binary(frame.into()), &mut role, &state, &ctx, "1.2.3.4").await;
-        let end = ControlMessage::FileUploadEnd { upload_id, text: Some("huge".into()) };
+        process_ws_message(
+            Message::Binary(frame.into()),
+            &mut role,
+            &state,
+            &ctx,
+            "1.2.3.4",
+        )
+        .await;
+        let end = ControlMessage::FileUploadEnd {
+            upload_id,
+            text: Some("huge".into()),
+        };
         process_ws_message(
             Message::Text(serde_json::to_string(&end).unwrap().into()),
-            &mut role, &state, &ctx, "1.2.3.4",
-        ).await;
+            &mut role,
+            &state,
+            &ctx,
+            "1.2.3.4",
+        )
+        .await;
 
         assert!(state.auth.db().list_bug_reports_for_test().is_empty());
     }
@@ -2870,7 +3020,9 @@ mod tests {
         let q = supervisor_query("sq-fan1", "fleet_status");
         handle_control_message(&q, &mut role, &state, &owner, "1.2.3.4").await;
 
-        let mut drole = ConnectionRole::Desktop { username: "alice".into() };
+        let mut drole = ConnectionRole::Desktop {
+            username: "alice".into(),
+        };
         let res = ControlMessage::SupervisorResult {
             id: "sq-fan1".into(),
             payload: serde_json::json!({ "fleet": [] }),
@@ -2907,7 +3059,9 @@ mod tests {
         drop(rx1);
 
         // Desktop result arrives → owner send fails → stored.
-        let mut drole = ConnectionRole::Desktop { username: "alice".into() };
+        let mut drole = ConnectionRole::Desktop {
+            username: "alice".into(),
+        };
         let res = ControlMessage::SupervisorResult {
             id: "sq-susp".into(),
             payload: serde_json::json!({ "status": "ok" }),
@@ -3008,6 +3162,135 @@ mod tests {
         h
     }
 
+    #[tokio::test]
+    async fn bug_report_tracking_http_lifecycle_and_validation() {
+        use tower::ServiceExt;
+        let state = test_state();
+        let db = state.auth.db();
+        db.create_account("alice", "hash", None, None).unwrap();
+        db.add_device("tracking-device", "alice", "PC", None)
+            .unwrap();
+        let id = db
+            .insert_bug_report("alice", "tracking-device", "broken", None, None)
+            .unwrap();
+        let foreign = db
+            .insert_bug_report("bob", "other", "private", None, None)
+            .unwrap();
+        let token = state.auth.create_jwt("alice", "tracking-device").unwrap();
+        let app = build_router(state.clone(), state.data_dir.clone());
+        let request = |method: &str, uri: String, body: &str, auth: bool| {
+            let mut builder = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json");
+            if auth {
+                builder = builder.header("authorization", format!("Bearer {token}"));
+            }
+            builder
+                .body(axum::body::Body::from(body.to_owned()))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/bug-reports".into(), "", true))
+            .await
+            .unwrap();
+        let body = response_json(response).await;
+        assert_eq!(body[0]["status"], "open");
+        for (body, expected) in [
+            (r#"{"status":"closed"}"#, StatusCode::BAD_REQUEST),
+            (
+                r#"{"status":"closed","resolution":"  "}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (r#"{"status":"invalid"}"#, StatusCode::BAD_REQUEST),
+            (r#"{"status":42}"#, StatusCode::BAD_REQUEST),
+            ("{", StatusCode::BAD_REQUEST),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request("PATCH", format!("/bug-reports/{id}"), body, true))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{body}");
+        }
+        let close = r#"{"status":"closed","resolution":"  Verified fix  "}"#;
+        for (target, auth, expected) in [
+            (id, false, StatusCode::UNAUTHORIZED),
+            (foreign, true, StatusCode::NOT_FOUND),
+            (99999, true, StatusCode::NOT_FOUND),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "PATCH",
+                    format!("/bug-reports/{target}"),
+                    close,
+                    auth,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let response = app
+            .clone()
+            .oneshot(request("PATCH", format!("/bug-reports/{id}"), close, true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["status"], "closed");
+        assert_eq!(body["resolution"], "Verified fix");
+        assert!(body["closed_at"].is_string());
+        for (filter, count) in [("open", 0), ("closed", 1)] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "GET",
+                    format!("/bug-reports?status={filter}&limit=1"),
+                    "",
+                    true,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response_json(response).await.as_array().unwrap().len(),
+                count
+            );
+        }
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/bug-reports?status=invalid".into(),
+                "",
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "PATCH",
+                format!("/bug-reports/{id}"),
+                r#"{"status":"open","resolution":"ignored"}"#,
+                true,
+            ))
+            .await
+            .unwrap();
+        let body = response_json(response).await;
+        assert_eq!(body["status"], "open");
+        assert!(body["resolution"].is_null());
+        assert!(body["closed_at"].is_null());
+        device::revoke_device(db, "tracking-device").unwrap();
+        let response = app
+            .oneshot(request("PATCH", format!("/bug-reports/{id}"), close, true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     async fn response_json(resp: Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -3039,7 +3322,10 @@ mod tests {
         let resp = list_bug_reports_handler(
             State(state.clone()),
             HeaderMap::new(),
-            Query(BugReportListQuery { limit: None }),
+            Query(BugReportListQuery {
+                limit: None,
+                status: None,
+            }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -3048,7 +3334,10 @@ mod tests {
         let resp = list_bug_reports_handler(
             State(state.clone()),
             bearer_headers("not-a-jwt"),
-            Query(BugReportListQuery { limit: None }),
+            Query(BugReportListQuery {
+                limit: None,
+                status: None,
+            }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -3060,14 +3349,18 @@ mod tests {
         let db = state.auth.db();
         db.create_account("alice", "hash", None, None).unwrap();
         db.add_device("dev-1", "alice", "Pixel 9", None).unwrap();
-        db.insert_bug_report("alice", "dev-1", "report", None, None).unwrap();
+        db.insert_bug_report("alice", "dev-1", "report", None, None)
+            .unwrap();
 
         // A registered device's JWT works.
         let token = state.auth.create_jwt("alice", "dev-1").unwrap();
         let resp = list_bug_reports_handler(
             State(state.clone()),
             bearer_headers(&token),
-            Query(BugReportListQuery { limit: None }),
+            Query(BugReportListQuery {
+                limit: None,
+                status: None,
+            }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3078,7 +3371,10 @@ mod tests {
         let resp = list_bug_reports_handler(
             State(state.clone()),
             bearer_headers(&token),
-            Query(BugReportListQuery { limit: None }),
+            Query(BugReportListQuery {
+                limit: None,
+                status: None,
+            }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -3112,17 +3408,22 @@ mod tests {
         db.add_device("dev-b", "bob", "iPhone", None).unwrap();
 
         let shot = write_screenshot(&state, b"\x89PNG-list");
-        db.insert_bug_report("alice", "dev-1", "first", None, None).unwrap();
+        db.insert_bug_report("alice", "dev-1", "first", None, None)
+            .unwrap();
         db.insert_bug_report("alice", "dev-1", "second", Some(&shot), Some("1.2.3"))
             .unwrap();
         // A different account's report must never appear.
-        db.insert_bug_report("bob", "dev-b", "bob-report", None, None).unwrap();
+        db.insert_bug_report("bob", "dev-b", "bob-report", None, None)
+            .unwrap();
 
         let token = state.auth.create_jwt("alice", "dev-1").unwrap();
         let resp = list_bug_reports_handler(
             State(state.clone()),
             bearer_headers(&token),
-            Query(BugReportListQuery { limit: None }),
+            Query(BugReportListQuery {
+                limit: None,
+                status: None,
+            }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3164,7 +3465,10 @@ mod tests {
         let resp = list_bug_reports_handler(
             State(state.clone()),
             bearer_headers(&token),
-            Query(BugReportListQuery { limit: Some(1) }),
+            Query(BugReportListQuery {
+                limit: Some(1),
+                status: None,
+            }),
         )
         .await;
         let body = response_json(resp).await;
@@ -3175,7 +3479,10 @@ mod tests {
         let resp = list_bug_reports_handler(
             State(state.clone()),
             bearer_headers(&token),
-            Query(BugReportListQuery { limit: Some(100_000) }),
+            Query(BugReportListQuery {
+                limit: Some(100_000),
+                status: None,
+            }),
         )
         .await;
         let body = response_json(resp).await;
