@@ -371,7 +371,16 @@ pub enum ControlMessage {
         download_id: String,
         session_id: String,
         path: String,
+        /// The client will send `file_download_ack` as bytes arrive, so the
+        /// desktop paces the stream and the file has no size ceiling. Absent
+        /// on clients that predate pacing.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        acks: bool,
     },
+    /// Client → relay → desktop: payload bytes of `download_id` received so
+    /// far. Only the requesting connection's acks are forwarded.
+    #[serde(rename = "file_download_ack")]
+    FileDownloadAck { download_id: String, received: u64 },
     /// Desktop announces the file it is about to stream; routed to the
     /// requesting client connection only.
     #[serde(rename = "file_download_begin")]
@@ -380,6 +389,11 @@ pub enum ControlMessage {
         name: String,
         size: u64,
         mime: String,
+        /// The desktop waits for the client's acks on this stream. Absent
+        /// from desktops that predate pacing; the relay keeps the old size
+        /// ceiling for those.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        paced: bool,
     },
     /// Desktop (or the relay, on rejection/overrun) reports the download
     /// outcome; routed to the requesting client connection only. Sent for both
@@ -876,16 +890,40 @@ mod tests {
                 download_id,
                 session_id,
                 path,
+                acks,
             } => {
                 assert_eq!(download_id, "d1");
                 assert_eq!(session_id, "s1");
                 assert_eq!(path, "/home/sean/a.md");
+                assert!(!acks);
             }
             _ => panic!("expected FileDownloadRequest"),
         }
         let reser: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
+    }
+
+    /// The relay re-serializes what it forwards, so a field it does not
+    /// declare never reaches the desktop. Pacing lives in `acks`.
+    #[test]
+    fn test_paced_download_request_and_ack_roundtrip() {
+        let json = r#"{"type":"file_download_request","download_id":"d1","session_id":"s1","path":"C:/a b/c.pdf","acks":true}"#;
+        let msg: ControlMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(&msg, ControlMessage::FileDownloadRequest { acks: true, .. }));
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
+
+        let ack = r#"{"type":"file_download_ack","download_id":"d1","received":524288}"#;
+        let msg: ControlMessage = serde_json::from_str(ack).unwrap();
+        assert!(matches!(
+            &msg,
+            ControlMessage::FileDownloadAck { download_id, received: 524_288 } if download_id == "d1"
+        ));
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(ack).unwrap());
     }
 
     #[test]
@@ -895,13 +933,14 @@ mod tests {
             name: "report.md".into(),
             size: 2048,
             mime: "text/markdown".into(),
+            paced: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"file_download_begin\""));
         assert!(json.contains("\"size\":2048"));
         let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
         match parsed {
-            ControlMessage::FileDownloadBegin { download_id, name, size, mime } => {
+            ControlMessage::FileDownloadBegin { download_id, name, size, mime, .. } => {
                 assert_eq!(download_id, "d1");
                 assert_eq!(name, "report.md");
                 assert_eq!(size, 2048);

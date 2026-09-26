@@ -207,6 +207,11 @@ struct DownloadEntry {
     declared_size: Option<u64>,
     /// Payload bytes forwarded to the client so far.
     bytes_forwarded: u64,
+    /// The desktop paces this stream by the client's `file_download_ack`s
+    /// (from its begin), so it has no size ceiling, only a window over `acked`.
+    paced: bool,
+    /// Highest byte count the owner acknowledged, clamped to `bytes_forwarded`.
+    acked: u64,
     /// Last time any message touched this download (for idle GC).
     last_activity: Instant,
 }
@@ -273,8 +278,9 @@ pub enum DownloadChunkDecision {
     /// No active download for this id (unknown/finished/severed) — drop.
     Drop,
     /// Byte budget exceeded — the download was severed; the caller sends a
-    /// relay-originated failure `file_download_end` to the owner.
-    Overrun(ConnTx),
+    /// relay-originated failure `file_download_end` carrying the reason to
+    /// the owner.
+    Overrun(ConnTx, &'static str),
 }
 
 /// Per-account state tracked by the broker.
@@ -324,7 +330,9 @@ const MAX_UPLOAD_SIZE: u64 = 25 * 1024 * 1024;
 /// Max concurrent uploads per account.
 const MAX_ACTIVE_UPLOADS: usize = 8;
 /// Hard cap on a single download's forwarded bytes (also caps the declared size).
-const MAX_DOWNLOAD_SIZE: u64 = 25 * 1024 * 1024;
+const MAX_UNPACED_DOWNLOAD_SIZE: u64 = 25 * 1024 * 1024;
+/// Unacknowledged bytes a paced download may run ahead of its owner.
+const PACED_DOWNLOAD_WINDOW: u64 = 8 * 1024 * 1024;
 /// Max concurrent downloads per account.
 const MAX_ACTIVE_DOWNLOADS: usize = 4;
 /// Uploads (and downloads) with no activity for this long are garbage-collected.
@@ -837,33 +845,68 @@ impl Broker {
                 owner: conn.clone(),
                 declared_size: None,
                 bytes_forwarded: 0,
+                paced: false,
+                acked: 0,
                 last_activity: Instant::now(),
             },
         );
         Ok(())
     }
 
+    /// Record a `file_download_ack` from a client. True means the sender owns
+    /// this paced download and the ack should be forwarded to the desktop.
+    pub async fn record_download_ack(
+        &self,
+        username: &str,
+        download_id: &str,
+        conn: &ConnTx,
+        received: u64,
+    ) -> bool {
+        let mut accounts = self.accounts.write().await;
+        let Some(state) = accounts.get_mut(username) else {
+            return false;
+        };
+        Self::gc_downloads(state);
+        let Some(entry) = state.downloads.get_mut(download_id) else {
+            return false;
+        };
+        if !entry.paced || !entry.owner.same_conn(conn) {
+            return false;
+        }
+        entry.acked = entry.acked.max(received.min(entry.bytes_forwarded));
+        entry.last_activity = Instant::now();
+        true
+    }
+
     /// Route a `file_download_begin` from the desktop: record the declared size
-    /// for byte budgeting and return the owning client connection. None means
-    /// the download_id is unknown — the caller drops the begin.
+    /// for byte budgeting, and whether the desktop paces this stream by the
+    /// client's acks, and return the owning client connection. None means the
+    /// download_id is unknown — the caller drops the begin. Pacing is the
+    /// desktop's word, not the client's: a desktop that predates it streams
+    /// without waiting, and holding it to the ack window would cut files the
+    /// old rules allowed.
     pub async fn note_download_begin(
         &self,
         username: &str,
         download_id: &str,
         size: u64,
+        paced: bool,
     ) -> Option<ConnTx> {
         let mut accounts = self.accounts.write().await;
         let state = accounts.get_mut(username)?;
         Self::gc_downloads(state);
         let entry = state.downloads.get_mut(download_id)?;
         entry.declared_size = Some(size);
+        entry.paced = paced;
         entry.last_activity = Instant::now();
         Some(entry.owner.clone())
     }
 
     /// Govern one `PTY_FILE_DOWNLOAD_CHUNK` from the desktop. Accounts the bytes
-    /// against the declared size / `MAX_DOWNLOAD_SIZE` and severs the download
-    /// on overrun. See `DownloadChunkDecision`.
+    /// against the declared size and severs the download on overrun. An
+    /// unpaced download is also capped at `MAX_UNPACED_DOWNLOAD_SIZE`; a paced
+    /// one may not run more than `PACED_DOWNLOAD_WINDOW` past its owner's
+    /// acks, which bounds what the relay queues for a slow client.
     pub async fn record_download_chunk(
         &self,
         username: &str,
@@ -880,11 +923,23 @@ impl Broker {
         };
         entry.bytes_forwarded += payload.len() as u64;
         entry.last_activity = Instant::now();
-        let budget = entry.declared_size.unwrap_or(MAX_DOWNLOAD_SIZE).min(MAX_DOWNLOAD_SIZE);
-        if entry.bytes_forwarded > budget {
+        let budget = match (entry.paced, entry.declared_size) {
+            (true, Some(size)) => size,
+            (_, declared) => declared
+                .unwrap_or(MAX_UNPACED_DOWNLOAD_SIZE)
+                .min(MAX_UNPACED_DOWNLOAD_SIZE),
+        };
+        let reason = if entry.bytes_forwarded > budget {
+            Some("size_exceeded")
+        } else if entry.paced && entry.bytes_forwarded - entry.acked > PACED_DOWNLOAD_WINDOW {
+            Some("ack_window_exceeded")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
             let owner = entry.owner.clone();
             state.downloads.remove(download_id);
-            return DownloadChunkDecision::Overrun(owner);
+            return DownloadChunkDecision::Overrun(owner, reason);
         }
         DownloadChunkDecision::Forward(entry.owner.clone())
     }
@@ -2014,7 +2069,7 @@ mod tests {
         broker.register_download("alice", "d1", &owner).await.unwrap();
 
         // begin records the declared size and returns the owner.
-        let begin_owner = broker.note_download_begin("alice", "d1", 4096).await.unwrap();
+        let begin_owner = broker.note_download_begin("alice", "d1", 4096, false).await.unwrap();
         assert!(begin_owner.same_conn(&owner));
         assert!(!begin_owner.same_conn(&other));
 
@@ -2030,7 +2085,7 @@ mod tests {
         let broker = Broker::new();
         let (owner, _orx) = test_conn();
         broker.register_download("alice", "d1", &owner).await.unwrap();
-        broker.note_download_begin("alice", "d1", 4096).await.unwrap();
+        broker.note_download_begin("alice", "d1", 4096, false).await.unwrap();
 
         match broker.record_download_chunk("alice", "d1", &[0u8; 512]).await {
             DownloadChunkDecision::Forward(tx) => assert!(tx.same_conn(&owner)),
@@ -2052,7 +2107,7 @@ mod tests {
         let broker = Broker::new();
         let (owner, _orx) = test_conn();
         broker.register_download("alice", "d1", &owner).await.unwrap();
-        broker.note_download_begin("alice", "d1", 1000).await.unwrap();
+        broker.note_download_begin("alice", "d1", 1000, false).await.unwrap();
         // Within budget.
         assert!(matches!(
             broker.record_download_chunk("alice", "d1", &[0u8; 800]).await,
@@ -2060,7 +2115,10 @@ mod tests {
         ));
         // Exceeds declared size → overrun; download state is dropped, owner returned.
         match broker.record_download_chunk("alice", "d1", &[0u8; 300]).await {
-            DownloadChunkDecision::Overrun(tx) => assert!(tx.same_conn(&owner)),
+            DownloadChunkDecision::Overrun(tx, reason) => {
+                assert!(tx.same_conn(&owner));
+                assert_eq!(reason, "size_exceeded");
+            }
             other => panic!("expected Overrun, got {other:?}"),
         }
         // Now there's no active download — subsequent chunks are dropped.
@@ -2068,6 +2126,82 @@ mod tests {
             broker.record_download_chunk("alice", "d1", &[0u8; 10]).await,
             DownloadChunkDecision::Drop
         ));
+    }
+
+    /// Stream `size` bytes in 32 KiB chunks, acking every 512 KiB like the
+    /// client does. Returns bytes forwarded before the first non-Forward.
+    async fn stream_paced(broker: &Broker, owner: &ConnTx, size: u64, ack: bool) -> (u64, DownloadChunkDecision) {
+        let chunk = [0u8; 32 * 1024];
+        let mut sent = 0u64;
+        let mut acked = 0u64;
+        while sent < size {
+            let n = (size - sent).min(chunk.len() as u64) as usize;
+            match broker.record_download_chunk("alice", "d1", &chunk[..n]).await {
+                DownloadChunkDecision::Forward(_) => sent += n as u64,
+                other => return (sent, other),
+            }
+            if ack && sent - acked >= 512 * 1024 {
+                assert!(broker.record_download_ack("alice", "d1", owner, sent).await);
+                acked = sent;
+            }
+        }
+        (sent, DownloadChunkDecision::Drop)
+    }
+
+    /// Owner report 2026-09-26: a 43,537,166-byte PDF was cut at 25 MiB.
+    #[tokio::test]
+    async fn test_paced_download_has_no_size_ceiling() {
+        let broker = Broker::new();
+        let (owner, _orx) = test_conn();
+        broker.register_download("alice", "d1", &owner).await.unwrap();
+        broker.note_download_begin("alice", "d1", 43_537_166, true).await.unwrap();
+        let (sent, stop) = stream_paced(&broker, &owner, 43_537_166, true).await;
+        assert_eq!(sent, 43_537_166, "stopped early with {stop:?}");
+        // The declared size still bounds it.
+        assert!(matches!(
+            broker.record_download_chunk("alice", "d1", &[0u8; 1]).await,
+            DownloadChunkDecision::Overrun(..)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_unpaced_download_keeps_old_ceiling() {
+        let broker = Broker::new();
+        let (owner, _orx) = test_conn();
+        broker.register_download("alice", "d1", &owner).await.unwrap();
+        broker.note_download_begin("alice", "d1", 43_537_166, false).await.unwrap();
+        let (sent, stop) = stream_paced(&broker, &owner, 43_537_166, false).await;
+        assert_eq!(sent, MAX_UNPACED_DOWNLOAD_SIZE);
+        assert!(matches!(stop, DownloadChunkDecision::Overrun(..)));
+    }
+
+    /// Relay memory per paced download stays bounded whatever the desktop
+    /// does: running past the window without acks severs it.
+    #[tokio::test]
+    async fn test_paced_download_without_acks_is_cut_at_window() {
+        let broker = Broker::new();
+        let (owner, _orx) = test_conn();
+        broker.register_download("alice", "d1", &owner).await.unwrap();
+        broker.note_download_begin("alice", "d1", 43_537_166, true).await.unwrap();
+        let (sent, stop) = stream_paced(&broker, &owner, 43_537_166, false).await;
+        assert!(sent <= PACED_DOWNLOAD_WINDOW, "forwarded {sent} unacked bytes");
+        assert!(sent + 32 * 1024 > PACED_DOWNLOAD_WINDOW, "cut too early at {sent}");
+        assert!(matches!(stop, DownloadChunkDecision::Overrun(..)));
+    }
+
+    #[tokio::test]
+    async fn test_ack_only_counts_from_owner_of_paced_download() {
+        let broker = Broker::new();
+        let (owner, _orx) = test_conn();
+        let (other, _xrx) = test_conn();
+        broker.register_download("alice", "d1", &owner).await.unwrap();
+        broker.register_download("alice", "d2", &owner).await.unwrap();
+        broker.note_download_begin("alice", "d1", 4096, true).await.unwrap();
+        broker.record_download_chunk("alice", "d1", &[0u8; 1024]).await;
+        assert!(!broker.record_download_ack("alice", "d1", &other, 1024).await);
+        assert!(!broker.record_download_ack("alice", "d2", &owner, 0).await);
+        assert!(!broker.record_download_ack("alice", "ghost", &owner, 0).await);
+        assert!(broker.record_download_ack("alice", "d1", &owner, 1024).await);
     }
 
     #[tokio::test]

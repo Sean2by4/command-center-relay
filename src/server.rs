@@ -959,12 +959,28 @@ async fn handle_control_message(
             }
         }
 
+        // Client reports bytes received on a paced download: forwarded to the
+        // desktop only from the requesting connection, and remembered so the
+        // relay can hold the desktop to the ack window. Ignored from a desktop.
+        ControlMessage::FileDownloadAck { download_id, received } => {
+            if let ConnectionRole::Client { username, .. } = role {
+                if state
+                    .broker
+                    .record_download_ack(username, download_id, outbound_tx, *received)
+                    .await
+                {
+                    let json = serde_json::to_string(msg).unwrap();
+                    let _ = state.broker.send_to_desktop(username, WsMessage::Text(json)).await;
+                }
+            }
+        }
+
         // Desktop announces the file stream: routed to the requesting client
         // connection ONLY, recording the declared size for chunk budgeting.
         // Unknown download_id → drop + warn. Ignored from a client.
-        ControlMessage::FileDownloadBegin { download_id, size, .. } => {
+        ControlMessage::FileDownloadBegin { download_id, size, paced, .. } => {
             if let ConnectionRole::Desktop { username } = role {
-                match state.broker.note_download_begin(username, download_id, *size).await {
+                match state.broker.note_download_begin(username, download_id, *size, *paced).await {
                     Some(tx) => {
                         let json = serde_json::to_string(msg).unwrap();
                         let _ = tx.send(WsMessage::Text(json));
@@ -1843,11 +1859,12 @@ async fn handle_binary_message(
                         DownloadChunkDecision::Forward(tx) => {
                             let _ = tx.send(WsMessage::Binary(data.to_vec()));
                         }
-                        DownloadChunkDecision::Overrun(tx) => {
+                        DownloadChunkDecision::Overrun(tx, reason) => {
+                            tracing::warn!(download_id = %upload_id, reason, "download severed");
                             let fail = ControlMessage::FileDownloadEnd {
                                 download_id: upload_id.clone(),
                                 ok: false,
-                                error: Some("size_exceeded".into()),
+                                error: Some(reason.into()),
                             };
                             let _ = tx.send(WsMessage::Text(serde_json::to_string(&fail).unwrap()));
                         }
@@ -2329,6 +2346,7 @@ mod tests {
             download_id: "d1".into(),
             session_id: "s1".into(),
             path: "/home/sean/a.md".into(),
+            acks: false,
         };
         handle_control_message(&req, &mut role, &state, &ctx, "1.2.3.4").await;
         // Forwarded verbatim to the desktop.
@@ -2419,6 +2437,7 @@ mod tests {
             download_id: "d-extra".into(),
             session_id: "s1".into(),
             path: "/x".into(),
+            acks: false,
         };
         handle_control_message(&req, &mut role, &state, &ctx, "1.2.3.4").await;
         // Over the cap: nothing reaches the desktop.
@@ -2432,6 +2451,110 @@ mod tests {
             }
             _ => panic!("expected failure end"),
         }
+    }
+
+    /// Owner report 2026-09-26: a 43,537,166-byte PDF. A paced request keeps
+    /// its `acks` flag on the way to the desktop, and the requester's acks are
+    /// forwarded; nobody else's are.
+    #[tokio::test]
+    async fn test_paced_download_forwards_flag_and_owner_acks() {
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx, None).await.unwrap();
+        drain_reconcile(&mut drx);
+
+        let (ctx, _crx) = test_conn();
+        let mut role = client_role();
+        let req = ControlMessage::FileDownloadRequest {
+            download_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd".into(),
+            session_id: "s1".into(),
+            path: "C:/a b/c.pdf".into(),
+            acks: true,
+        };
+        handle_control_message(&req, &mut role, &state, &ctx, "1.2.3.4").await;
+        match drx.recv().await.unwrap() {
+            WsMessage::Text(t) => assert!(t.contains("\"acks\":true"), "got: {t}"),
+            other => panic!("expected request forwarded to desktop, got {other:?}"),
+        }
+
+        let begin = ControlMessage::FileDownloadBegin {
+            download_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd".into(),
+            name: "c.pdf".into(),
+            size: 43_537_166,
+            mime: "application/pdf".into(),
+            paced: true,
+        };
+        let mut desktop_role = ConnectionRole::Desktop { username: "alice".into() };
+        let (dsock, _dsrx) = test_conn();
+        handle_control_message(&begin, &mut desktop_role, &state, &dsock, "1.2.3.4").await;
+        let frame = protocol::build_binary_frame(
+            protocol::PTY_FILE_DOWNLOAD_CHUNK,
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            &vec![7u8; 32 * 1024],
+        );
+        handle_binary_message(&frame, &desktop_role, &state, &dsock).await;
+
+        let ack = ControlMessage::FileDownloadAck { download_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd".into(), received: 32 * 1024 };
+        // Another connection's ack for the same id goes nowhere.
+        let (stranger, _srx) = test_conn();
+        handle_control_message(&ack, &mut client_role(), &state, &stranger, "5.6.7.8").await;
+        assert!(drx.try_recv().is_err(), "a stranger's ack reached the desktop");
+
+        handle_control_message(&ack, &mut role, &state, &ctx, "1.2.3.4").await;
+        match drx.try_recv().expect("owner's ack was not forwarded") {
+            WsMessage::Text(t) => {
+                assert!(t.contains("file_download_ack"), "got: {t}");
+                assert!(t.contains("\"received\":32768"), "got: {t}");
+            }
+            other => panic!("expected ack text, got {other:?}"),
+        }
+    }
+
+    /// A client asking for pacing, a desktop that predates it: the desktop
+    /// streams without waiting for acks, as it always has. The relay must keep
+    /// the old rules for that stream, not cut it at the paced window on a
+    /// phone that drains slower than the desktop sends.
+    #[tokio::test]
+    async fn test_paced_request_to_an_unpacing_desktop_keeps_old_rules() {
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx.clone(), None).await.unwrap();
+        drain_reconcile(&mut drx);
+        let (ctx, mut crx) = test_conn();
+        let mut role = client_role();
+        let req = ControlMessage::FileDownloadRequest {
+            download_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd".into(),
+            session_id: "s1".into(),
+            path: "C:/a/big.pdf".into(),
+            acks: true,
+        };
+        handle_control_message(&req, &mut role, &state, &ctx, "1.2.3.4").await;
+
+        // The old desktop's begin, byte for byte: no pacing field.
+        let begin: ControlMessage = serde_json::from_str(
+            r#"{"type":"file_download_begin","download_id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","name":"big.pdf","size":20971520,"mime":"application/pdf"}"#,
+        )
+        .unwrap();
+        let mut drole = desktop_role();
+        handle_control_message(&begin, &mut drole, &state, &dtx, "1.2.3.4").await;
+        let frame = protocol::build_binary_frame(
+            protocol::PTY_FILE_DOWNLOAD_CHUNK,
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            &vec![7u8; 32 * 1024],
+        );
+        // 20 MiB with no ack at all: a phone far behind the desktop.
+        for _ in 0..640 {
+            handle_binary_message(&frame, &drole, &state, &dtx).await;
+        }
+        let mut chunks = 0;
+        while let Ok(msg) = crx.try_recv() {
+            match msg {
+                WsMessage::Binary(_) => chunks += 1,
+                WsMessage::Text(t) => assert!(!t.contains("\"ok\":false"), "severed: {t}"),
+                _ => {}
+            }
+        }
+        assert_eq!(chunks, 640);
     }
 
     #[tokio::test]
@@ -2450,6 +2573,7 @@ mod tests {
             name: "a.md".into(),
             size: 16,
             mime: "text/markdown".into(),
+            paced: false,
         };
         handle_control_message(&begin, &mut drole, &state, &dtx, "1.2.3.4").await;
         // Owner receives the begin; the other client does not.
@@ -2482,6 +2606,7 @@ mod tests {
             name: "a".into(),
             size: 1,
             mime: "application/octet-stream".into(),
+            paced: false,
         };
         // No panic, nothing to route — the unknown id is dropped with a warn.
         handle_control_message(&begin, &mut drole, &state, &dtx, "1.2.3.4").await;
@@ -2494,7 +2619,7 @@ mod tests {
         let (ctx, mut crx) = test_conn();
         let (id, frame) = download_frame(b"filedata");
         state.broker.register_download("alice", &id, &ctx).await.unwrap();
-        state.broker.note_download_begin("alice", &id, 4096).await.unwrap();
+        state.broker.note_download_begin("alice", &id, 4096, false).await.unwrap();
 
         handle_binary_message(&frame, &desktop_role(), &state, &dtx).await;
         match crx.recv().await.unwrap() {
@@ -2511,7 +2636,7 @@ mod tests {
         let (id, frame) = download_frame(b"way-too-long");
         state.broker.register_download("alice", &id, &ctx).await.unwrap();
         // Declared size smaller than the payload → overrun on first chunk.
-        state.broker.note_download_begin("alice", &id, 4).await.unwrap();
+        state.broker.note_download_begin("alice", &id, 4, false).await.unwrap();
 
         handle_binary_message(&frame, &desktop_role(), &state, &dtx).await;
         // Owner gets a relay-originated failure end, not the chunk bytes.
