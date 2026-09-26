@@ -905,7 +905,8 @@ mod tests {
     }
 
     /// The relay re-serializes what it forwards, so a field it does not
-    /// declare never reaches the desktop. Pacing lives in `acks`.
+    /// declare never reaches the desktop: the request's `acks`, the begin's
+    /// `paced`, and the ack itself must all survive the round trip.
     #[test]
     fn test_paced_download_request_and_ack_roundtrip() {
         let json = r#"{"type":"file_download_request","download_id":"d1","session_id":"s1","path":"C:/a b/c.pdf","acks":true}"#;
@@ -914,6 +915,13 @@ mod tests {
         let reser: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(reser, serde_json::from_str::<serde_json::Value>(json).unwrap());
+
+        let begin = r#"{"type":"file_download_begin","download_id":"d1","name":"c.pdf","size":43537166,"mime":"application/pdf","paced":true}"#;
+        let msg: ControlMessage = serde_json::from_str(begin).unwrap();
+        assert!(matches!(&msg, ControlMessage::FileDownloadBegin { paced: true, .. }));
+        let reser: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(reser, serde_json::from_str::<serde_json::Value>(begin).unwrap());
 
         let ack = r#"{"type":"file_download_ack","download_id":"d1","received":524288}"#;
         let msg: ControlMessage = serde_json::from_str(ack).unwrap();

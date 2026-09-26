@@ -444,22 +444,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, ip: String) {
     // instead of silently dropping frames — see broker::ConnTx).
     let (raw_tx, mut outbound_rx) = mpsc::unbounded_channel::<WsMessage>();
     let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let outbound_tx = ConnTx::new(raw_tx, queued.clone());
+    let outbound_tx = ConnTx::new(raw_tx, queued);
+    let counters = outbound_tx.queue_counters();
 
     // Spawn outbound writer
     let writer = tokio::spawn(async move {
         use futures_util::SinkExt;
-        use std::sync::atomic::Ordering;
         while let Some(msg) = outbound_rx.recv().await {
+            counters.taken(&msg);
             let ws_msg = match msg {
-                WsMessage::Text(t) => {
-                    queued.fetch_sub(t.len(), Ordering::Relaxed);
-                    Message::Text(t.into())
-                }
-                WsMessage::Binary(b) => {
-                    queued.fetch_sub(b.len(), Ordering::Relaxed);
-                    Message::Binary(b.into())
-                }
+                WsMessage::Text(t) => Message::Text(t.into()),
+                WsMessage::Binary(b) => Message::Binary(b.into()),
                 WsMessage::Close => {
                     let _ = ws_sender.close().await;
                     break;
@@ -964,12 +959,16 @@ async fn handle_control_message(
         // relay can hold the desktop to the ack window. Ignored from a desktop.
         ControlMessage::FileDownloadAck { download_id, received } => {
             if let ConnectionRole::Client { username, .. } = role {
-                if state
+                if let Some(acked) = state
                     .broker
                     .record_download_ack(username, download_id, outbound_tx, *received)
                     .await
                 {
-                    let json = serde_json::to_string(msg).unwrap();
+                    let ack = ControlMessage::FileDownloadAck {
+                        download_id: download_id.clone(),
+                        received: acked,
+                    };
+                    let json = serde_json::to_string(&ack).unwrap();
                     let _ = state.broker.send_to_desktop(username, WsMessage::Text(json)).await;
                 }
             }
@@ -2508,6 +2507,154 @@ mod tests {
             }
             other => panic!("expected ack text, got {other:?}"),
         }
+    }
+
+    /// Review finding 2026-09-26: a client that claims more than the relay
+    /// forwarded would open the desktop's window completely; the desktop
+    /// then reads the rest of the file into its own unbounded queue while the
+    /// relay cuts the stream. The desktop hears only what was forwarded.
+    #[tokio::test]
+    async fn test_ack_reaches_desktop_clamped_to_bytes_forwarded() {
+        let id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx.clone(), None).await.unwrap();
+        drain_reconcile(&mut drx);
+        let (ctx, _crx) = test_conn();
+        let mut role = client_role();
+        let req = ControlMessage::FileDownloadRequest {
+            download_id: id.into(),
+            session_id: "s1".into(),
+            path: "C:/a/big.pdf".into(),
+            acks: true,
+        };
+        handle_control_message(&req, &mut role, &state, &ctx, "1.2.3.4").await;
+        let _ = drx.try_recv();
+        let begin = ControlMessage::FileDownloadBegin {
+            download_id: id.into(),
+            name: "big.pdf".into(),
+            size: 10_000_000_000,
+            mime: "application/pdf".into(),
+            paced: true,
+        };
+        let drole = desktop_role();
+        handle_control_message(&begin, &mut desktop_role(), &state, &dtx, "1.2.3.4").await;
+        let frame =
+            protocol::build_binary_frame(protocol::PTY_FILE_DOWNLOAD_CHUNK, id, &vec![7u8; 32 * 1024]);
+        handle_binary_message(&frame, &drole, &state, &dtx).await;
+
+        let ack = ControlMessage::FileDownloadAck { download_id: id.into(), received: 9_000_000_000 };
+        handle_control_message(&ack, &mut role, &state, &ctx, "1.2.3.4").await;
+        match drx.try_recv().expect("ack was not forwarded") {
+            WsMessage::Text(t) => assert!(t.contains("\"received\":32768"), "forwarded unclamped: {t}"),
+            other => panic!("expected ack text, got {other:?}"),
+        }
+    }
+
+    /// Second review 2026-09-26: the ack clamp counts bytes the relay
+    /// queued, not bytes that reached the phone. A client that stops reading
+    /// but keeps acking would have the relay queue the whole file for it.
+    /// The relay measures its own queue instead of trusting the claim.
+    #[tokio::test]
+    async fn test_client_that_acks_without_reading_is_cut_at_the_window() {
+        let id = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx.clone(), None).await.unwrap();
+        drain_reconcile(&mut drx);
+        let (ctx, mut crx) = test_conn();
+        let mut role = client_role();
+        let req = ControlMessage::FileDownloadRequest {
+            download_id: id.into(),
+            session_id: "s1".into(),
+            path: "C:/a/big.pdf".into(),
+            acks: true,
+        };
+        handle_control_message(&req, &mut role, &state, &ctx, "1.2.3.4").await;
+        let begin = ControlMessage::FileDownloadBegin {
+            download_id: id.into(),
+            name: "big.pdf".into(),
+            size: 10_000_000_000,
+            mime: "application/pdf".into(),
+            paced: true,
+        };
+        let drole = desktop_role();
+        handle_control_message(&begin, &mut desktop_role(), &state, &dtx, "1.2.3.4").await;
+        let frame =
+            protocol::build_binary_frame(protocol::PTY_FILE_DOWNLOAD_CHUNK, id, &vec![7u8; 32 * 1024]);
+        let ack = ControlMessage::FileDownloadAck { download_id: id.into(), received: u64::MAX };
+        // 16 MiB, every chunk acked in full, and nothing ever read from `crx`.
+        for _ in 0..512 {
+            handle_binary_message(&frame, &drole, &state, &dtx).await;
+            handle_control_message(&ack, &mut role, &state, &ctx, "1.2.3.4").await;
+        }
+        let mut queued_chunks = 0u64;
+        let mut cut = None;
+        while let Ok(msg) = crx.try_recv() {
+            match msg {
+                WsMessage::Binary(_) => queued_chunks += 1,
+                WsMessage::Text(t) if t.contains("\"ok\":false") => cut = Some(t),
+                _ => {}
+            }
+        }
+        assert!(
+            cut.as_deref().is_some_and(|t| t.contains("client_backlog")),
+            "not cut after {queued_chunks} chunks: {cut:?}"
+        );
+        assert!(queued_chunks * 32 * 1024 <= 8 * 1024 * 1024 + 32 * 1024, "queued {queued_chunks} chunks");
+    }
+
+    /// The other side of the queue check: a client that reads (drained here
+    /// the way its writer task drains it) is never cut, however large the
+    /// file, even while it is up to a desktop window behind.
+    #[tokio::test]
+    async fn test_reading_client_downloads_the_owner_sized_file_uncut() {
+        let id = "abababab-abab-4bab-8bab-abababababab";
+        let size: u64 = 43_537_166;
+        let state = test_state();
+        let (dtx, mut drx) = test_conn();
+        state.broker.register_desktop("alice", dtx.clone(), None).await.unwrap();
+        drain_reconcile(&mut drx);
+        let (ctx, mut crx) = test_conn();
+        let counters = ctx.queue_counters();
+        let mut role = client_role();
+        let req = ControlMessage::FileDownloadRequest {
+            download_id: id.into(),
+            session_id: "s1".into(),
+            path: "C:/a/owner.pdf".into(),
+            acks: true,
+        };
+        handle_control_message(&req, &mut role, &state, &ctx, "1.2.3.4").await;
+        let begin = ControlMessage::FileDownloadBegin {
+            download_id: id.into(),
+            name: "owner.pdf".into(),
+            size,
+            mime: "application/pdf".into(),
+            paced: true,
+        };
+        let drole = desktop_role();
+        handle_control_message(&begin, &mut desktop_role(), &state, &dtx, "1.2.3.4").await;
+        let (mut sent, mut received) = (0u64, 0u64);
+        while sent < size {
+            let n = (size - sent).min(32 * 1024) as usize;
+            let frame = protocol::build_binary_frame(protocol::PTY_FILE_DOWNLOAD_CHUNK, id, &vec![7u8; n]);
+            handle_binary_message(&frame, &drole, &state, &dtx).await;
+            sent += n as u64;
+            // The phone lags a full desktop window, then catches up and acks.
+            if sent - received >= 1024 * 1024 || sent == size {
+                while let Ok(msg) = crx.try_recv() {
+                    counters.taken(&msg);
+                    match msg {
+                        WsMessage::Binary(b) => received += (b.len() - 37) as u64,
+                        WsMessage::Text(t) => assert!(!t.contains("\"ok\":false"), "cut: {t}"),
+                        WsMessage::Close => {}
+                    }
+                }
+                let ack = ControlMessage::FileDownloadAck { download_id: id.into(), received };
+                handle_control_message(&ack, &mut role, &state, &ctx, "1.2.3.4").await;
+            }
+        }
+        assert_eq!(received, size);
     }
 
     /// A client asking for pacing, a desktop that predates it: the desktop

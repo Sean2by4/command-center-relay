@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
 
-use crate::protocol::PTY_OUTPUT;
+use crate::protocol::{PTY_FILE_DOWNLOAD_CHUNK, PTY_OUTPUT};
 
 /// A message that can be sent over a WebSocket connection.
 #[derive(Debug, Clone)]
@@ -27,6 +27,10 @@ impl WsMessage {
         matches!(self, WsMessage::Binary(b) if b.first() == Some(&PTY_OUTPUT))
     }
 
+    fn is_download_chunk(&self) -> bool {
+        matches!(self, WsMessage::Binary(b) if b.first() == Some(&PTY_FILE_DOWNLOAD_CHUNK))
+    }
+
     /// Session id slot of a PTY_OUTPUT frame: bytes 1..37, space-padded
     /// (mirrors the desktop's `build_binary_frame`). None for non-output
     /// frames or malformed headers.
@@ -36,6 +40,22 @@ impl WsMessage {
                 std::str::from_utf8(&b[1..37]).ok().map(str::trim)
             }
             _ => None,
+        }
+    }
+}
+
+/// A connection's queue accounting, as seen by its writer task.
+pub struct QueueCounters {
+    queued: Arc<AtomicUsize>,
+    downloads_queued: Arc<AtomicUsize>,
+}
+
+impl QueueCounters {
+    /// The writer took `msg` off the queue.
+    pub fn taken(&self, msg: &WsMessage) {
+        self.queued.fetch_sub(msg.byte_len(), Ordering::Relaxed);
+        if msg.is_download_chunk() {
+            self.downloads_queued.fetch_sub(msg.byte_len(), Ordering::Relaxed);
         }
     }
 }
@@ -53,6 +73,8 @@ impl WsMessage {
 pub struct ConnTx {
     tx: mpsc::UnboundedSender<WsMessage>,
     queued: Arc<AtomicUsize>,
+    /// The part of `queued` that is file-download chunks.
+    downloads_queued: Arc<AtomicUsize>,
     dirty: Arc<AtomicBool>,
     last_resync: Arc<TokioMutex<Option<Instant>>>,
     /// Sessions this client is actively viewing (`session_focus` message).
@@ -76,6 +98,7 @@ impl ConnTx {
         Self {
             tx,
             queued,
+            downloads_queued: Arc::new(AtomicUsize::new(0)),
             dirty: Arc::new(AtomicBool::new(false)),
             last_resync: Arc::new(TokioMutex::new(None)),
             focus: Arc::new(StdRwLock::new(None)),
@@ -105,7 +128,25 @@ impl ConnTx {
     /// Enqueue unconditionally (control traffic, replay, desktop-bound).
     pub fn send(&self, msg: WsMessage) -> Result<(), ()> {
         self.queued.fetch_add(msg.byte_len(), Ordering::Relaxed);
+        if msg.is_download_chunk() {
+            self.downloads_queued.fetch_add(msg.byte_len(), Ordering::Relaxed);
+        }
         self.tx.send(msg).map_err(|_| ())
+    }
+
+    /// The counters the connection's writer task decrements. Held apart from
+    /// the ConnTx so the writer does not keep its own channel open.
+    pub fn queue_counters(&self) -> QueueCounters {
+        QueueCounters {
+            queued: self.queued.clone(),
+            downloads_queued: self.downloads_queued.clone(),
+        }
+    }
+
+    /// Download bytes waiting in this connection's queue: what the relay is
+    /// holding because the client has not read it yet.
+    fn download_bytes_queued(&self) -> u64 {
+        self.downloads_queued.load(Ordering::Relaxed) as u64
     }
 
     /// Enqueue live PTY output, applying the dirty/budget policy.
@@ -329,9 +370,13 @@ const MAX_REPLAY_QUEUE: usize = 64;
 const MAX_UPLOAD_SIZE: u64 = 25 * 1024 * 1024;
 /// Max concurrent uploads per account.
 const MAX_ACTIVE_UPLOADS: usize = 8;
-/// Hard cap on a single download's forwarded bytes (also caps the declared size).
+/// Cap on the forwarded bytes of a download whose desktop does not pace it
+/// (one that predates pacing); the relay would queue all of it for a slow
+/// client.
 const MAX_UNPACED_DOWNLOAD_SIZE: u64 = 25 * 1024 * 1024;
-/// Unacknowledged bytes a paced download may run ahead of its owner.
+/// How far a paced download may run ahead of its owner before the relay cuts
+/// it: in acknowledged bytes, and in download bytes waiting in the owner's
+/// queue. Desktops keep 1 MiB in flight; this is the backstop.
 const PACED_DOWNLOAD_WINDOW: u64 = 8 * 1024 * 1024;
 /// Max concurrent downloads per account.
 const MAX_ACTIVE_DOWNLOADS: usize = 4;
@@ -853,29 +898,29 @@ impl Broker {
         Ok(())
     }
 
-    /// Record a `file_download_ack` from a client. True means the sender owns
-    /// this paced download and the ack should be forwarded to the desktop.
+    /// Record a `file_download_ack` from a client. `Some(acked)` means the
+    /// sender owns this paced download: forward `acked` to the desktop. It is
+    /// clamped to the bytes the relay forwarded, so a client that claims more
+    /// cannot get the desktop reading ahead of what reached the relay. Bytes
+    /// the relay queued are not bytes the client received; the owner's queue
+    /// check in `record_download_chunk` bounds a client that acks unread data.
     pub async fn record_download_ack(
         &self,
         username: &str,
         download_id: &str,
         conn: &ConnTx,
         received: u64,
-    ) -> bool {
+    ) -> Option<u64> {
         let mut accounts = self.accounts.write().await;
-        let Some(state) = accounts.get_mut(username) else {
-            return false;
-        };
+        let state = accounts.get_mut(username)?;
         Self::gc_downloads(state);
-        let Some(entry) = state.downloads.get_mut(download_id) else {
-            return false;
-        };
+        let entry = state.downloads.get_mut(download_id)?;
         if !entry.paced || !entry.owner.same_conn(conn) {
-            return false;
+            return None;
         }
         entry.acked = entry.acked.max(received.min(entry.bytes_forwarded));
         entry.last_activity = Instant::now();
-        true
+        Some(entry.acked)
     }
 
     /// Route a `file_download_begin` from the desktop: record the declared size
@@ -906,7 +951,9 @@ impl Broker {
     /// against the declared size and severs the download on overrun. An
     /// unpaced download is also capped at `MAX_UNPACED_DOWNLOAD_SIZE`; a paced
     /// one may not run more than `PACED_DOWNLOAD_WINDOW` past its owner's
-    /// acks, which bounds what the relay queues for a slow client.
+    /// acks, nor add to an owner queue already holding that much download
+    /// data, which bounds what the relay queues for a client whatever it
+    /// claims.
     pub async fn record_download_chunk(
         &self,
         username: &str,
@@ -933,6 +980,8 @@ impl Broker {
             Some("size_exceeded")
         } else if entry.paced && entry.bytes_forwarded - entry.acked > PACED_DOWNLOAD_WINDOW {
             Some("ack_window_exceeded")
+        } else if entry.paced && entry.owner.download_bytes_queued() > PACED_DOWNLOAD_WINDOW {
+            Some("client_backlog")
         } else {
             None
         };
@@ -2141,7 +2190,7 @@ mod tests {
                 other => return (sent, other),
             }
             if ack && sent - acked >= 512 * 1024 {
-                assert!(broker.record_download_ack("alice", "d1", owner, sent).await);
+                assert_eq!(broker.record_download_ack("alice", "d1", owner, sent).await, Some(sent));
                 acked = sent;
             }
         }
@@ -2198,10 +2247,12 @@ mod tests {
         broker.register_download("alice", "d2", &owner).await.unwrap();
         broker.note_download_begin("alice", "d1", 4096, true).await.unwrap();
         broker.record_download_chunk("alice", "d1", &[0u8; 1024]).await;
-        assert!(!broker.record_download_ack("alice", "d1", &other, 1024).await);
-        assert!(!broker.record_download_ack("alice", "d2", &owner, 0).await);
-        assert!(!broker.record_download_ack("alice", "ghost", &owner, 0).await);
-        assert!(broker.record_download_ack("alice", "d1", &owner, 1024).await);
+        assert_eq!(broker.record_download_ack("alice", "d1", &other, 1024).await, None);
+        assert_eq!(broker.record_download_ack("alice", "d2", &owner, 0).await, None);
+        assert_eq!(broker.record_download_ack("alice", "ghost", &owner, 0).await, None);
+        assert_eq!(broker.record_download_ack("alice", "d1", &owner, 1024).await, Some(1024));
+        // More than was forwarded counts only what was forwarded.
+        assert_eq!(broker.record_download_ack("alice", "d1", &owner, 1 << 40).await, Some(1024));
     }
 
     #[tokio::test]
