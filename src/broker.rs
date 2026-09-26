@@ -2177,8 +2177,8 @@ mod tests {
         ));
     }
 
-    /// Stream `size` bytes in 32 KiB chunks, acking every 512 KiB like the
-    /// client does. Returns bytes forwarded before the first non-Forward.
+    /// Stream `size` bytes in 32 KiB chunks, acking every 512 KiB (the web
+    /// client acks every 256 KiB; any interval under the window works). Returns bytes forwarded before the first non-Forward.
     async fn stream_paced(broker: &Broker, owner: &ConnTx, size: u64, ack: bool) -> (u64, DownloadChunkDecision) {
         let chunk = [0u8; 32 * 1024];
         let mut sent = 0u64;
