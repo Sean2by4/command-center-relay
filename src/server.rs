@@ -21,8 +21,11 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 
-/// Max size for text/JSON WebSocket messages (16 KB).
-const MAX_TEXT_MESSAGE_SIZE: usize = 16 * 1024;
+/// Max size for text/JSON WebSocket messages (256 KB). The desktop's
+/// session_list carries every open session (~340 bytes each) plus the account
+/// roster in one frame; at 16 KB a ~50-session fleet was silently dropped and
+/// remote clients lost their session list (2026-10-04).
+const MAX_TEXT_MESSAGE_SIZE: usize = 256 * 1024;
 /// Max size for binary WebSocket messages (64 KB).
 const MAX_BINARY_MESSAGE_SIZE: usize = 64 * 1024;
 /// Max new WebSocket connections per IP per minute.
@@ -807,7 +810,7 @@ async fn handle_control_message(
             }
             // The desktop publishes its OWN bug reports over this same governed
             // upload path (screenshot in binary chunks, not inline JSON — which
-            // the 16KB text gate would drop). ONLY `bug_report` is accepted from
+            // the text gate would drop). ONLY `bug_report` is accepted from
             // a desktop; this does not open a general desktop-upload capability.
             // Nothing is forwarded — the desktop is the endpoint.
             if let ConnectionRole::Desktop { username } = role {
@@ -2743,6 +2746,50 @@ mod tests {
         assert!(orx.try_recv().is_err(), "end must not reach non-owner");
     }
 
+    /// A ~50-session fleet's session_list must pass the real receive-loop text
+    /// gate and reach the client intact. On 2026-10-04 the desktop's frames were
+    /// 16.7-17.9KB and the old 16KB cap silently dropped every one, so the PWA's
+    /// list never arrived. Entries here are sized like the real ones (~330B:
+    /// topic labels plus worktree cwds), not like toy fixtures.
+    #[tokio::test]
+    async fn test_large_session_list_passes_text_gate_to_client() {
+        let state = test_state();
+        let (dtx, _drx) = test_conn();
+        let (ctx, mut crx) = test_conn();
+        state.broker.register_client("alice", ctx.clone(), info_for("dev-1")).await.unwrap();
+
+        let sessions: Vec<crate::protocol::SessionInfo> = (0..60)
+            .map(|i| crate::protocol::SessionInfo {
+                id: format!("{:08x}-0000-4000-8000-{:012x}", i, i),
+                label: format!(
+                    "Firechatter worker seat {i}: usage pace, parallel lanes and the v8 steer review against the latest goal brief"
+                ),
+                cwd: format!("C:\\Users\\sean2\\firechatter-rerun\\.claude\\worktrees\\v8-lane-{i}"),
+                cols: 173,
+                rows: 43,
+                created_at: Some(1_791_085_389_563),
+                account_id: Some(format!("{}", i % 15)),
+                kind: Some("claude".into()),
+            })
+            .collect();
+        let list = ControlMessage::SessionList { sessions, accounts: None };
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(json.len() > 16 * 1024, "frame must exceed the old 16KB cap");
+
+        let mut drole = desktop_role();
+        process_ws_message(Message::Text(json.into()), &mut drole, &state, &dtx, "1.2.3.4").await;
+
+        match crx.try_recv() {
+            Ok(WsMessage::Text(t)) => {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                assert_eq!(v["type"], "session_list");
+                assert_eq!(v["sessions"].as_array().unwrap().len(), 60);
+            }
+            Ok(_) => panic!("expected a text session_list at the client"),
+            Err(e) => panic!("session_list never reached the client: {e:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_desktop_download_begin_unknown_id_dropped() {
         let state = test_state();
@@ -3045,7 +3092,7 @@ mod tests {
     // The desktop publishes its OWN reports via the SAME governed upload path
     // clients use: a bug_report file_upload_begin, the screenshot in binary
     // PTY_FILE_CHUNK frames, then file_upload_end. Screenshots therefore never
-    // ride an inline JSON text frame (which the 16KB gate would drop).
+    // ride an inline JSON text frame (which the text gate would drop).
 
     fn desktop_role() -> ConnectionRole {
         ConnectionRole::Desktop {
@@ -3080,7 +3127,7 @@ mod tests {
     }
 
     /// End-to-end through the REAL receive-loop gates: a bug-report screenshot
-    /// far larger than the 16KB text cap persists (row + file) attributed to the
+    /// far larger than the text cap persists (row + file) attributed to the
     /// desktop. Inline JSON would be dropped at the text gate before reaching a
     /// handler; travelling as binary chunks it survives.
     #[tokio::test]
@@ -3090,9 +3137,11 @@ mod tests {
         let (ctx, _crx) = test_conn();
         let mut role = desktop_role();
 
-        // 200KB screenshot — over 12x the text gate; a base64-in-JSON frame
-        // would be dropped at MAX_TEXT_MESSAGE_SIZE.
-        let png: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        // Screenshot sized at twice the text gate, so a base64-in-JSON frame
+        // would be dropped at MAX_TEXT_MESSAGE_SIZE whatever the cap is.
+        let png: Vec<u8> = (0..(2 * MAX_TEXT_MESSAGE_SIZE) as u32)
+            .map(|i| (i % 251) as u8)
+            .collect();
         assert!(png.len() > MAX_TEXT_MESSAGE_SIZE, "screenshot must exceed the text gate");
 
         let upload_id = "d".repeat(36);
